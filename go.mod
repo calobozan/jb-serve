@@ -9,6 +9,8 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+replace github.com/richinsley/jumpboot => github.com/calobozan/jumpboot v1.0.2-fix1
+
 require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect

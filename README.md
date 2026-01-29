@@ -78,8 +78,11 @@ jb-serve install github.com/calobozan/jb-calculator
 jb-serve list
 
 # Call a method (oneshot - starts Python, runs, exits)
-jb-serve call calculator.add --a 2 --b 3
+jb-serve call calculator.add a=2 b=3
 # {"result": 5}
+
+# Or with JSON
+jb-serve call calculator.add --json '{"a": 2, "b": 3}'
 
 # Start HTTP API for agent access
 jb-serve serve --port 9800
@@ -93,7 +96,7 @@ jb-serve serve --port 9800
 - Best for: stateless tools, infrequent calls, low-memory environments
 
 ```bash
-jb-serve call calculator.add --a 2 --b 3
+jb-serve call calculator.add a=2 b=3
 ```
 
 ### Persistent
@@ -243,7 +246,8 @@ jb-serve info <tool>              # Show tool details and methods
 jb-serve schema <tool>[.method]   # Show RPC schema
 
 # Execution
-jb-serve call <tool.method> ...   # Call a method (oneshot or on running persistent)
+jb-serve call <tool.method> [key=value ...]   # Call with key=value params
+jb-serve call <tool.method> --json '{...}'    # Call with JSON params
 jb-serve start <tool>             # Start a persistent tool
 jb-serve stop <tool>              # Stop a persistent tool
 
@@ -283,10 +287,10 @@ auth_token: "your-secret-token"  # Optional - enables auth on HTTP API
 - [x] CLI: `install`, `list`, `info`, `schema`, `call`, `serve`
 - [x] Schema-aware parameter parsing (string → number/bool conversion)
 - [x] Auth token middleware (via config.yaml)
+- [x] Dynamic parameters via `key=value` syntax or `--json`
 
 ### 🚧 In Progress
 - [ ] Persistent tool mode (`start`/`stop` commands exist, needs testing)
-- [ ] Dynamic CLI flags from schema (currently hardcoded `--a`, `--b`, etc.)
 
 ### 📋 Planned
 - [ ] Health checks for persistent tools

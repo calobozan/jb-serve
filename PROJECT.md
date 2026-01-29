@@ -29,6 +29,7 @@ A generic server that hosts multiple Python tools, each with its own isolated en
 | `github.com/calobozan/jb-service` | Python SDK for tool authors |
 | `github.com/calobozan/jb-calculator` | Reference oneshot tool (old style) |
 | `~/projects/jb-calculator-new` | Reference tool using jb-service |
+| `~/projects/jb-whisper` | Audio transcription tool (Whisper) |
 
 ---
 
@@ -113,19 +114,25 @@ jb-serve call calculator.add a=5 b=3  # → 8
 
 ## Next Up (Phase 3)
 
-### Binary File Handling
-Design doc: `docs/BINARY-HANDLING.md`
+### Completed
+- [x] **jb-whisper** — Audio transcription tool working
+  - Uses file paths directly (no complex FileRef abstraction needed)
+  - Persistent mode with model kept loaded
+  - Works via HTTP API: `POST /v1/tools/whisper/transcribe {"audio": "/path/to/file.wav"}`
 
-For tools like jb-whisper (audio in) and jb-sdxl (images out), we need:
-- File input via path/url/base64
-- File output with managed references
-- `/v1/files/{ref}` endpoint for retrieval
+### Binary Handling Simplified
+The `docs/BINARY-HANDLING.md` design is overkill for local use. Tools just:
+- Take file paths as strings
+- Read/write files directly
+- Return paths in responses
 
-### Candidates
-- [ ] jb-whisper — Audio transcription (needs binary input)
+The FileRef/multipart/managed-refs complexity can wait until we need remote HTTP clients uploading binary data.
+
+### Remaining Candidates
+- [ ] CLI daemon mode (so `jb-serve start` persists)
 - [ ] Auto-restart on health failure
-- [ ] CLI daemon mode
 - [ ] Re-enable structured logging (disabled due to REPL interference)
+- [ ] jb-sdxl — Image generation (when ready)
 
 ---
 
@@ -171,13 +178,18 @@ jb-serve install github.com/someone/their-tool
 # List tools
 jb-serve list
 
-# Call methods
+# Call oneshot methods via CLI
 jb-serve call calculator.add a=5 b=3
 jb-serve call calculator.divide a=10 b=2
 
-# HTTP API
+# HTTP API (required for persistent tools)
 jb-serve serve --port 9800
-curl -X POST http://localhost:9800/v1/tools/calculator/add \
+
+# Start persistent tool, then call
+curl -X POST http://localhost:9800/v1/tools/whisper/start
+curl -X POST http://localhost:9800/v1/tools/whisper/transcribe \
   -H "Content-Type: application/json" \
-  -d '{"a": 5, "b": 3}'
+  -d '{"audio": "/path/to/audio.wav"}'
 ```
+
+**Note:** Persistent tools (mode: persistent) require server mode — the CLI `start` command exits immediately, losing the REPL. Use `jb-serve serve` for persistent tools.

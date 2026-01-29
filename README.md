@@ -218,6 +218,8 @@ All endpoints return JSON. Use `Authorization: Bearer <token>` header when auth 
 | `/v1/tools` | GET | List all tools with capabilities |
 | `/v1/tools/{name}` | GET | Tool info and available methods |
 | `/v1/tools/{name}/schema` | GET | Full RPC schema for all methods |
+| `/v1/tools/{name}/start` | POST | Start a persistent tool |
+| `/v1/tools/{name}/stop` | POST | Stop a persistent tool |
 | `/v1/tools/{name}/{method}` | POST | Call a method with JSON body |
 
 ### Examples
@@ -283,14 +285,15 @@ auth_token: "your-secret-token"  # Optional - enables auth on HTTP API
 - [x] Install tools from git URL or local path
 - [x] Isolated Python environments via jumpboot/micromamba
 - [x] Oneshot execution (call → run → exit)
-- [x] HTTP API: `/health`, `/v1/tools`, `/v1/tools/{name}`, `/v1/tools/{name}/schema`, `/v1/tools/{name}/{method}`
-- [x] CLI: `install`, `list`, `info`, `schema`, `call`, `serve`
+- [x] Persistent tool mode (start → call → call → stop, state maintained)
+- [x] HTTP API: all endpoints including `/start` and `/stop` for persistent tools
+- [x] CLI: `install`, `list`, `info`, `schema`, `call`, `start`, `stop`, `serve`
 - [x] Schema-aware parameter parsing (string → number/bool conversion)
 - [x] Auth token middleware (via config.yaml)
 - [x] Dynamic parameters via `key=value` syntax or `--json`
 
 ### 🚧 In Progress
-- [ ] Persistent tool mode (`start`/`stop` commands exist, needs testing)
+- [ ] CLI `start`/`stop` with daemon mode (currently only works via HTTP server)
 
 ### 📋 Planned
 - [ ] Health checks for persistent tools
@@ -304,6 +307,7 @@ auth_token: "your-secret-token"  # Optional - enables auth on HTTP API
 | Tool | Description | Mode |
 |------|-------------|------|
 | [jb-calculator](https://github.com/calobozan/jb-calculator) | Reference implementation — basic math | oneshot |
+| [jb-counter](https://github.com/calobozan/jb-counter) | Reference for persistent mode — stateful counter | persistent |
 | jb-whisper | Audio transcription (planned) | persistent |
 | jb-embed | Text embeddings (planned) | persistent |
 | jb-sdxl | Image generation (planned) | persistent |

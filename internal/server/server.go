@@ -126,17 +126,41 @@ func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	methodName := parts[1]
+	action := parts[1]
 
 	// GET /v1/tools/{name}/schema
-	if methodName == "schema" && r.Method == http.MethodGet {
+	if action == "schema" && r.Method == http.MethodGet {
 		s.json(w, tool.Manifest.RPC.Methods)
 		return
 	}
 
-	// POST /v1/tools/{name}/{method}
+	// POST /v1/tools/{name}/start - start a persistent tool
+	if action == "start" && r.Method == http.MethodPost {
+		if tool.Manifest.Runtime.Mode != "persistent" {
+			s.json(w, map[string]string{"error": "tool is not a persistent tool"})
+			return
+		}
+		if err := s.executor.Start(toolName); err != nil {
+			s.json(w, map[string]string{"error": err.Error()})
+			return
+		}
+		s.json(w, map[string]string{"status": "started", "tool": toolName})
+		return
+	}
+
+	// POST /v1/tools/{name}/stop - stop a persistent tool
+	if action == "stop" && r.Method == http.MethodPost {
+		if err := s.executor.Stop(toolName); err != nil {
+			s.json(w, map[string]string{"error": err.Error()})
+			return
+		}
+		s.json(w, map[string]string{"status": "stopped", "tool": toolName})
+		return
+	}
+
+	// POST /v1/tools/{name}/{method} - call a method
 	if r.Method == http.MethodPost {
-		_, ok := tool.Manifest.RPC.Methods[methodName]
+		_, ok := tool.Manifest.RPC.Methods[action]
 		if !ok {
 			http.Error(w, "Method not found", http.StatusNotFound)
 			return
@@ -150,7 +174,7 @@ func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		result, err := s.executor.Call(toolName, methodName, params)
+		result, err := s.executor.Call(toolName, action, params)
 		if err != nil {
 			s.json(w, map[string]string{"error": err.Error()})
 			return

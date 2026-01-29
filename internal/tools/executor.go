@@ -1,26 +1,31 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/richinsley/jumpboot"
 )
 
 // Executor handles RPC calls to tools using jumpboot
 type Executor struct {
-	manager *Manager
-	repls   map[string]*jumpboot.REPLPythonProcess
-	mu      sync.RWMutex
+	manager       *Manager
+	repls         map[string]*jumpboot.REPLPythonProcess
+	healthCancels map[string]context.CancelFunc
+	mu            sync.RWMutex
 }
 
 // NewExecutor creates a new executor
 func NewExecutor(manager *Manager) *Executor {
 	return &Executor{
-		manager: manager,
-		repls:   make(map[string]*jumpboot.REPLPythonProcess),
+		manager:       manager,
+		repls:         make(map[string]*jumpboot.REPLPythonProcess),
+		healthCancels: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -173,6 +178,15 @@ func (e *Executor) Start(toolName string) error {
 
 	e.repls[toolName] = repl
 	tool.Status = "running"
+	tool.HealthStatus = "unknown"
+	tool.HealthFailures = 0
+
+	// Start health check if configured
+	if tool.Manifest.Health != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		e.healthCancels[toolName] = cancel
+		go e.runHealthCheck(ctx, tool)
+	}
 
 	fmt.Printf("Started %s\n", toolName)
 	return nil
@@ -193,9 +207,17 @@ func (e *Executor) Stop(toolName string) error {
 		return fmt.Errorf("tool %s is not running", toolName)
 	}
 
+	// Cancel health check if running
+	if cancel, ok := e.healthCancels[toolName]; ok {
+		cancel()
+		delete(e.healthCancels, toolName)
+	}
+
 	repl.Close()
 	delete(e.repls, toolName)
 	tool.Status = "stopped"
+	tool.HealthStatus = ""
+	tool.HealthFailures = 0
 
 	fmt.Printf("Stopped %s\n", toolName)
 	return nil
@@ -206,11 +228,93 @@ func (e *Executor) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Cancel all health checks
+	for _, cancel := range e.healthCancels {
+		cancel()
+	}
+	e.healthCancels = make(map[string]context.CancelFunc)
+
+	// Close all REPLs
 	for name, repl := range e.repls {
 		repl.Close()
 		if tool, ok := e.manager.Get(name); ok {
 			tool.Status = "stopped"
+			tool.HealthStatus = ""
 		}
 	}
 	e.repls = make(map[string]*jumpboot.REPLPythonProcess)
+}
+
+// runHealthCheck runs periodic health checks for a tool
+func (e *Executor) runHealthCheck(ctx context.Context, tool *Tool) {
+	healthCfg := tool.Manifest.Health
+	interval := time.Duration(healthCfg.Interval) * time.Second
+	method := healthCfg.Method
+	threshold := healthCfg.FailureThreshold
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Initial health check after a short delay
+	time.Sleep(2 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := e.doHealthCheck(tool, method)
+			if err != nil {
+				tool.HealthFailures++
+				if tool.HealthFailures >= threshold {
+					if tool.HealthStatus != "unhealthy" {
+						tool.HealthStatus = "unhealthy"
+						log.Printf("Health check failed for %s: %v (failures: %d)", tool.Name, err, tool.HealthFailures)
+					}
+				}
+			} else {
+				if tool.HealthStatus != "healthy" {
+					log.Printf("Health check passed for %s", tool.Name)
+				}
+				tool.HealthStatus = "healthy"
+				tool.HealthFailures = 0
+			}
+		}
+	}
+}
+
+// doHealthCheck performs a single health check call
+func (e *Executor) doHealthCheck(tool *Tool, method string) error {
+	e.mu.RLock()
+	repl, ok := e.repls[tool.Name]
+	e.mu.RUnlock()
+
+	if !ok || repl == nil {
+		return fmt.Errorf("tool not running")
+	}
+
+	// Call the health method
+	callExpr := fmt.Sprintf("%s.%s()", tool.Name, method)
+	result, err := repl.Execute(callExpr, true)
+	if err != nil {
+		return fmt.Errorf("health call failed: %w", err)
+	}
+
+	// Parse result and check status
+	resultStr := result
+	if len(resultStr) >= 2 && resultStr[0] == '\'' && resultStr[len(resultStr)-1] == '\'' {
+		resultStr = resultStr[1 : len(resultStr)-1]
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal([]byte(resultStr), &response); err != nil {
+		return fmt.Errorf("invalid health response: %w", err)
+	}
+
+	// Check for "ok" status
+	if status, ok := response["status"].(string); ok && status == "ok" {
+		return nil
+	}
+
+	return fmt.Errorf("unhealthy status: %v", response)
 }

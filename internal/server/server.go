@@ -78,6 +78,7 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 		Capabilities []string `json:"capabilities"`
 		Mode         string   `json:"mode"`
 		Status       string   `json:"status"`
+		HealthStatus string   `json:"health_status,omitempty"`
 		Methods      []string `json:"methods"`
 	}
 
@@ -97,6 +98,7 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 			Capabilities: t.Manifest.Capabilities,
 			Mode:         t.Manifest.Runtime.Mode,
 			Status:       t.Status,
+			HealthStatus: t.HealthStatus,
 			Methods:      methods,
 		}
 	}

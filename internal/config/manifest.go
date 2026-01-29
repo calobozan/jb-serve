@@ -56,8 +56,9 @@ type Schema struct {
 
 // Health defines health check configuration
 type Health struct {
-	Endpoint string `yaml:"endpoint,omitempty"` // default: /health
-	Interval int    `yaml:"interval,omitempty"` // seconds
+	Method           string `yaml:"method,omitempty"`            // Method to call, default: "health"
+	Interval         int    `yaml:"interval,omitempty"`          // Seconds between checks, default: 30
+	FailureThreshold int    `yaml:"failure_threshold,omitempty"` // Consecutive failures before unhealthy, default: 3
 }
 
 // ApplyDefaults fills in sensible defaults
@@ -74,7 +75,15 @@ func (m *Manifest) ApplyDefaults() {
 	if m.RPC.Transport == "" {
 		m.RPC.Transport = "jsonqueue"
 	}
-	if m.Health != nil && m.Health.Endpoint == "" {
-		m.Health.Endpoint = "/health"
+	if m.Health != nil {
+		if m.Health.Method == "" {
+			m.Health.Method = "health"
+		}
+		if m.Health.Interval == 0 {
+			m.Health.Interval = 30
+		}
+		if m.Health.FailureThreshold == 0 {
+			m.Health.FailureThreshold = 3
+		}
 	}
 }

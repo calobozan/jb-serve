@@ -47,6 +47,8 @@ A service that hosts Python tools using [jumpboot](https://github.com/richinsley
 
 These decisions were made early to keep scope manageable:
 
+> **Note:** Jumpboot's bootstrap code ensures that if the parent Go process terminates, all child Python processes are also terminated. This prevents orphan Python processes — no zombie cleanup required.
+
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | RPC Transport | HTTP | Universal — every language can call it. Auth layer included. |
@@ -180,10 +182,11 @@ rpc:
           duration_seconds:
             type: number
 
-# Health check for persistent tools
+# Health check for persistent tools (optional)
 health:
-  endpoint: /health           # Default health check endpoint
-  interval: 30                # Seconds between checks
+  method: health              # Method to call (default: "health")
+  interval: 30                # Seconds between checks (default: 30)
+  failure_threshold: 3        # Consecutive failures before unhealthy (default: 3)
 ```
 
 ### Python Implementation
@@ -286,6 +289,7 @@ auth_token: "your-secret-token"  # Optional - enables auth on HTTP API
 - [x] Isolated Python environments via jumpboot/micromamba
 - [x] Oneshot execution (call → run → exit)
 - [x] Persistent tool mode (start → call → call → stop, state maintained)
+- [x] Health checks for persistent tools (configurable interval, failure threshold)
 - [x] HTTP API: all endpoints including `/start` and `/stop` for persistent tools
 - [x] CLI: `install`, `list`, `info`, `schema`, `call`, `start`, `stop`, `serve`
 - [x] Schema-aware parameter parsing (string → number/bool conversion)
@@ -296,7 +300,6 @@ auth_token: "your-secret-token"  # Optional - enables auth on HTTP API
 - [ ] CLI `start`/`stop` with daemon mode (currently only works via HTTP server)
 
 ### 📋 Planned
-- [ ] Health checks for persistent tools
 - [ ] Better error messages and validation
 - [ ] GPU resource hints in scheduling
 - [ ] Tool hot-reload without restart

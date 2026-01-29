@@ -15,13 +15,15 @@ import (
 
 // Tool represents an installed tool with its jumpboot environment
 type Tool struct {
-	Name     string           `json:"name"`
-	Path     string           `json:"path"`      // Filesystem path to tool repo
-	Manifest *config.Manifest `json:"manifest"`
-	Env      *jumpboot.PythonEnvironment `json:"-"`    // Jumpboot environment
-	Status   string           `json:"status"`    // "stopped", "running"
-	PID      int              `json:"pid,omitempty"`
-	Port     int              `json:"port,omitempty"`
+	Name           string                      `json:"name"`
+	Path           string                      `json:"path"`             // Filesystem path to tool repo
+	Manifest       *config.Manifest            `json:"manifest"`
+	Env            *jumpboot.PythonEnvironment `json:"-"`                // Jumpboot environment
+	Status         string                      `json:"status"`           // "stopped", "running"
+	HealthStatus   string                      `json:"health_status"`    // "healthy", "unhealthy", "unknown"
+	HealthFailures int                         `json:"health_failures"`  // Consecutive health check failures
+	PID            int                         `json:"pid,omitempty"`
+	Port           int                         `json:"port,omitempty"`
 }
 
 // Manager handles tool lifecycle using jumpboot
@@ -303,6 +305,7 @@ type ToolInfo struct {
 	Capabilities []string                 `json:"capabilities"`
 	Mode         string                   `json:"mode"`
 	Status       string                   `json:"status"`
+	HealthStatus string                   `json:"health_status,omitempty"`
 	Methods      map[string]config.Method `json:"methods"`
 }
 
@@ -320,6 +323,7 @@ func (m *Manager) Info(name string) (*ToolInfo, error) {
 		Capabilities: tool.Manifest.Capabilities,
 		Mode:         tool.Manifest.Runtime.Mode,
 		Status:       tool.Status,
+		HealthStatus: tool.HealthStatus,
 		Methods:      tool.Manifest.RPC.Methods,
 	}, nil
 }

@@ -60,6 +60,13 @@ ssh calo@192.168.0.107 "systemctl status jb-serve"
 ssh calo@192.168.0.107 "journalctl -u jb-serve -f"  # logs
 ```
 
+### System Dependencies
+Some tools need system packages on the GPU server:
+```bash
+# whisper needs ffmpeg
+ssh calo@192.168.0.107 "sudo apt-get install -y ffmpeg"
+```
+
 ---
 
 ## Current State
@@ -173,10 +180,11 @@ jb-serve call calculator.add a=5 b=3  # → 8
 ## Next Up (Phase 3)
 
 ### Completed
-- [x] **jb-whisper** — Audio transcription tool working
+- [x] **jb-whisper** — Audio transcription tool working (deployed on GPU server)
   - Uses file paths directly (no complex FileRef abstraction needed)
   - Persistent mode with model kept loaded
   - Works via HTTP API: `POST /v1/tools/whisper/transcribe {"audio": "/path/to/file.wav"}`
+  - Requires `ffmpeg` on the server: `sudo apt-get install ffmpeg`
 
 ### Binary Handling Simplified
 The `docs/BINARY-HANDLING.md` design is overkill for local use. Tools just:

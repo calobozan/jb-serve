@@ -69,7 +69,7 @@ rpc:
 
 ### Goals
 - [ ] Persistent tool mode working reliably
-- [ ] Suppress jumpboot debug output
+- [x] Suppress jumpboot debug output (using calobozan/jumpboot fork, PR #2 upstream)
 - [ ] Dynamic CLI flags from schema
 - [ ] Auth token support for HTTP API
 - [ ] Better error handling and reporting

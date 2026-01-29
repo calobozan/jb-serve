@@ -4,6 +4,60 @@
 
 A generic server that hosts multiple Python tools, each with its own isolated environment. Tools are git repos with manifests that describe their capabilities, dependencies, and RPC interface. An agent (AI or human) can discover available tools and call them via CLI or HTTP API.
 
+---
+
+## Development Workflow
+
+**Target: GPU Server** — jb-serve runs on `192.168.0.107` (gpu-server) as a systemd service.
+
+### Production Server
+- **URL**: `http://192.168.0.107:9800`
+- **Service**: `jb-serve.service` (systemd, auto-starts)
+- **Binary**: `~/bin/jb-serve` on gpu-server
+- **Tools dir**: `~/.jb-serve/tools/` on gpu-server
+
+### Deploy jb-serve Changes
+```bash
+# Build locally
+cd ~/projects/jb-serve && go build -o jb-serve ./cmd/jb-serve
+
+# Deploy to GPU server
+scp jb-serve calo@192.168.0.107:~/bin/
+ssh calo@192.168.0.107 "sudo systemctl restart jb-serve"
+```
+
+### Deploy a New Tool
+```bash
+# Copy tool to GPU server
+scp -r ~/projects/jb-whisper calo@192.168.0.107:~/projects/
+
+# Install on server
+ssh calo@192.168.0.107 "~/bin/jb-serve install ~/projects/jb-whisper"
+```
+
+### Test via HTTP (not local CLI)
+```bash
+# List tools
+curl http://192.168.0.107:9800/v1/tools
+
+# Call methods
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
+  -H "Content-Type: application/json" \
+  -d '{"audio": "/path/on/gpu-server/file.wav"}'
+
+# Start/stop persistent tools
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/start
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/stop
+```
+
+### Check Server Status
+```bash
+ssh calo@192.168.0.107 "systemctl status jb-serve"
+ssh calo@192.168.0.107 "journalctl -u jb-serve -f"  # logs
+```
+
+---
+
 ## Current State
 
 ### Phase 1 ✅ — Core Infrastructure
@@ -168,28 +222,24 @@ The FileRef/multipart/managed-refs complexity can wait until we need remote HTTP
 
 ---
 
-## Usage
+## Usage (GPU Server)
+
+See **Development Workflow** above for deployment steps.
 
 ```bash
-# Install a tool
-jb-serve install ~/projects/jb-calculator-new
-jb-serve install github.com/someone/their-tool
+# List tools on server
+curl http://192.168.0.107:9800/v1/tools
 
-# List tools
-jb-serve list
+# Start persistent tool
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/start
 
-# Call oneshot methods via CLI
-jb-serve call calculator.add a=5 b=3
-jb-serve call calculator.divide a=10 b=2
-
-# HTTP API (required for persistent tools)
-jb-serve serve --port 9800
-
-# Start persistent tool, then call
-curl -X POST http://localhost:9800/v1/tools/whisper/start
-curl -X POST http://localhost:9800/v1/tools/whisper/transcribe \
+# Call methods
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
   -H "Content-Type: application/json" \
-  -d '{"audio": "/path/to/audio.wav"}'
+  -d '{"audio": "/path/on/server/audio.wav"}'
+
+# Stop tool
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/stop
 ```
 
-**Note:** Persistent tools (mode: persistent) require server mode — the CLI `start` command exits immediately, losing the REPL. Use `jb-serve serve` for persistent tools.
+**Note:** File paths in requests must be paths on the GPU server, not local paths.

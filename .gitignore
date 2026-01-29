@@ -1,4 +1,9 @@
-jb-serve
+# Binary (root level only)
+/jb-serve
 *.exe
+
+# OS
 .DS_Store
+
+# Go
 vendor/

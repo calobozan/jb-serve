@@ -107,7 +107,7 @@ ssh calo@192.168.0.107 "sudo apt-get install -y ffmpeg"
 
 **main.py:**
 ```python
-from jb_service import Service, method, run
+from jb_service import Service, method, run, FilePath, Audio, Image
 
 class Calculator(Service):
     name = "calculator"
@@ -121,6 +121,42 @@ class Calculator(Service):
 if __name__ == "__main__":
     run(Calculator)
 ```
+
+### File Input Types
+
+Use type hints to control how file inputs are delivered to your method:
+
+```python
+from jb_service import Service, method, run, FilePath, Audio, Image
+
+class MediaProcessor(Service):
+    name = "media-processor"
+    
+    @method
+    def transcribe(self, audio: FilePath) -> dict:
+        # audio = "/path/to/file.wav" (string path)
+        # Use when your library handles file loading (like whisper)
+        ...
+    
+    @method
+    def analyze_audio(self, audio: Audio) -> dict:
+        # audio = (sample_rate, numpy_array)
+        # Pre-loaded by jb-service using soundfile/scipy/librosa
+        sample_rate, data = audio
+        ...
+    
+    @method
+    def describe_image(self, image: Image) -> dict:
+        # image = PIL.Image
+        # Pre-loaded by jb-service using Pillow
+        width, height = image.size
+        ...
+```
+
+**Available types:**
+- `FilePath` — Pass path as string (no loading)
+- `Audio` — Load as `(sample_rate, numpy_array)` tuple
+- `Image` — Load as `PIL.Image`
 
 **jumpboot.yaml:**
 ```yaml
@@ -194,6 +230,10 @@ jb-serve call calculator.add a=5 b=3  # → 8
   - `curl -F "audio=@local-file.wav" -F 'params={...}'`
   - Files saved to temp, cleaned up after call
   - Works alongside JSON paths for server-local files
+- [x] **File type hints (jb-service)** — Declarative file handling in Python
+  - `FilePath` — pass path string (tool handles loading)
+  - `Audio` — pre-load as (sample_rate, numpy_array)
+  - `Image` — pre-load as PIL.Image
 
 ### Binary Handling (Implemented)
 Simplified from the original `docs/BINARY-HANDLING.md` design:

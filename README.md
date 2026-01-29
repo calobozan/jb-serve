@@ -311,8 +311,8 @@ auth_token: "your-secret-token"  # Optional - enables auth on HTTP API
 |------|-------------|------|
 | [jb-calculator](https://github.com/calobozan/jb-calculator) | Reference implementation — basic math | oneshot |
 | [jb-counter](https://github.com/calobozan/jb-counter) | Reference for persistent mode — stateful counter | persistent |
+| [jb-embed](https://github.com/calobozan/jb-embed) | Text embeddings via sentence-transformers | persistent |
 | jb-whisper | Audio transcription (planned) | persistent |
-| jb-embed | Text embeddings (planned) | persistent |
 | jb-sdxl | Image generation (planned) | persistent |
 
 ## License

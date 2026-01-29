@@ -18,12 +18,16 @@ A generic server that hosts multiple Python tools, each with its own isolated en
 
 ### Deploy jb-serve Changes
 ```bash
-# Build locally
-cd ~/projects/jb-serve && go build -o jb-serve ./cmd/jb-serve
+# Build for Linux (GPU server is x86_64 Linux)
+cd ~/projects/jb-serve
+GOOS=linux GOARCH=amd64 go build -o jb-serve-linux ./cmd/jb-serve
 
 # Deploy to GPU server
-scp jb-serve calo@192.168.0.107:~/bin/
+scp jb-serve-linux calo@192.168.0.107:/home/calo/bin/jb-serve
+
+# Restart service
 ssh calo@192.168.0.107 "sudo systemctl restart jb-serve"
+# Or if sudo hangs: ssh calo@192.168.0.107 "pkill jb-serve; nohup ~/bin/jb-serve serve --port 9800 &"
 ```
 
 ### Deploy a New Tool

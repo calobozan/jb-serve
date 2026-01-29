@@ -44,10 +44,15 @@ ssh calo@192.168.0.107 "~/bin/jb-serve install ~/projects/jb-whisper"
 # List tools
 curl http://192.168.0.107:9800/v1/tools
 
-# Call methods
+# Call with file path (file must exist on server)
 curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
   -H "Content-Type: application/json" \
   -d '{"audio": "/path/on/gpu-server/file.wav"}'
+
+# Call with file upload (multipart) - file sent from client
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
+  -F "audio=@/local/path/to/file.wav" \
+  -F 'params={"language": "en"}'
 
 # Start/stop persistent tools
 curl -X POST http://192.168.0.107:9800/v1/tools/whisper/start
@@ -185,14 +190,28 @@ jb-serve call calculator.add a=5 b=3  # → 8
   - Persistent mode with model kept loaded
   - Works via HTTP API: `POST /v1/tools/whisper/transcribe {"audio": "/path/to/file.wav"}`
   - Requires `ffmpeg` on the server: `sudo apt-get install ffmpeg`
+- [x] **Multipart file upload** — Upload files directly to tools from remote clients
+  - `curl -F "audio=@local-file.wav" -F 'params={...}'`
+  - Files saved to temp, cleaned up after call
+  - Works alongside JSON paths for server-local files
 
-### Binary Handling Simplified
-The `docs/BINARY-HANDLING.md` design is overkill for local use. Tools just:
-- Take file paths as strings
-- Read/write files directly
-- Return paths in responses
+### Binary Handling (Implemented)
+Simplified from the original `docs/BINARY-HANDLING.md` design:
 
-The FileRef/multipart/managed-refs complexity can wait until we need remote HTTP clients uploading binary data.
+**Input options:**
+1. **JSON with path** — file already on server: `{"audio": "/path/on/server.wav"}`
+2. **Multipart upload** — file sent from client: `-F "audio=@local.wav"`
+
+**How it works:**
+- Server detects `multipart/form-data` content type
+- Saves uploaded files to `~/.jb-serve/uploads/`
+- Passes file path to tool (tool just sees a path)
+- Cleans up temp files after method returns
+
+**Not implemented (not needed yet):**
+- URL fetching (`{"audio": {"url": "https://..."}`)
+- Base64 inline (`{"audio": {"data": "base64..."}}`)
+- Managed output refs (`/v1/files/{ref}` endpoint)
 
 ### Remaining Candidates
 - [ ] CLI daemon mode (so `jb-serve start` persists)

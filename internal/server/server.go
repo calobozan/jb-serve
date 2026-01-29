@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/calobozan/jb-serve/internal/config"
+	"github.com/calobozan/jb-serve/internal/files"
 	"github.com/calobozan/jb-serve/internal/tools"
 )
 
@@ -16,15 +17,22 @@ type Server struct {
 	cfg      *config.Config
 	manager  *tools.Manager
 	executor *tools.Executor
+	files    *files.Manager
 	mux      *http.ServeMux
 }
 
 // New creates a new API server
 func New(cfg *config.Config, manager *tools.Manager, executor *tools.Executor) *Server {
+	fileMgr, err := files.NewManager(cfg.BaseDir())
+	if err != nil {
+		log.Printf("Warning: failed to create file manager: %v", err)
+	}
+
 	s := &Server{
 		cfg:      cfg,
 		manager:  manager,
 		executor: executor,
+		files:    fileMgr,
 		mux:      http.NewServeMux(),
 	}
 	s.setupRoutes()
@@ -162,18 +170,21 @@ func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
 
 	// POST /v1/tools/{name}/{method} - call a method
 	if r.Method == http.MethodPost {
-		_, ok := tool.Manifest.RPC.Methods[action]
+		method, ok := tool.Manifest.RPC.Methods[action]
 		if !ok {
 			http.Error(w, "Method not found", http.StatusNotFound)
 			return
 		}
 
-		var params map[string]interface{}
-		if r.ContentLength > 0 {
-			if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
-				http.Error(w, "Invalid JSON", http.StatusBadRequest)
-				return
-			}
+		params, tempFiles, err := s.parseRequestParams(r, method)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Ensure temp files are cleaned up after the call
+		if len(tempFiles) > 0 && s.files != nil {
+			defer s.files.CleanupAll(tempFiles)
 		}
 
 		result, err := s.executor.Call(toolName, action, params)
@@ -192,4 +203,92 @@ func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
 func (s *Server) json(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
+}
+
+// parseRequestParams extracts parameters from JSON or multipart form data
+// Returns params map, list of temp file paths to clean up, and any error
+func (s *Server) parseRequestParams(r *http.Request, method config.Method) (map[string]interface{}, []string, error) {
+	params := make(map[string]interface{})
+	var tempFiles []string
+
+	contentType := r.Header.Get("Content-Type")
+
+	// Handle multipart form data (file uploads)
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if s.files == nil {
+			return nil, nil, fmt.Errorf("file uploads not configured")
+		}
+
+		// Parse multipart form (32MB max memory, rest goes to temp files)
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse multipart form: %w", err)
+		}
+
+		// Get file fields from schema
+		fileFields := getFileFields(method)
+
+		// Process uploaded files
+		for fieldName := range r.MultipartForm.File {
+			file, header, err := r.FormFile(fieldName)
+			if err != nil {
+				continue
+			}
+			defer file.Close()
+
+			// Save to temp and get path
+			path, err := s.files.SaveUpload(file, header)
+			if err != nil {
+				// Clean up any files we've already saved
+				s.files.CleanupAll(tempFiles)
+				return nil, nil, fmt.Errorf("failed to save upload %s: %w", fieldName, err)
+			}
+
+			tempFiles = append(tempFiles, path)
+			params[fieldName] = path
+		}
+
+		// Process non-file form values
+		for key, values := range r.MultipartForm.Value {
+			if len(values) > 0 {
+				// Special case: "params" field contains JSON with other parameters
+				if key == "params" {
+					var jsonParams map[string]interface{}
+					if err := json.Unmarshal([]byte(values[0]), &jsonParams); err == nil {
+						for k, v := range jsonParams {
+							// Don't overwrite file fields
+							if _, isFile := fileFields[k]; !isFile {
+								params[k] = v
+							}
+						}
+					}
+				} else if _, isFile := fileFields[key]; !isFile {
+					params[key] = values[0]
+				}
+			}
+		}
+
+		return params, tempFiles, nil
+	}
+
+	// Handle JSON (default)
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+			return nil, nil, fmt.Errorf("invalid JSON: %w", err)
+		}
+	}
+
+	return params, nil, nil
+}
+
+// getFileFields returns a set of field names that have type "file" in the schema
+func getFileFields(method config.Method) map[string]bool {
+	fileFields := make(map[string]bool)
+	if method.Input != nil && method.Input.Properties != nil {
+		for name, prop := range method.Input.Properties {
+			if prop != nil && prop.Type == "file" {
+				fileFields[name] = true
+			}
+		}
+	}
+	return fileFields
 }

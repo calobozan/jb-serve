@@ -39,19 +39,19 @@ type RPC struct {
 
 // Method defines a single RPC method
 type Method struct {
-	Description string  `yaml:"description"`
-	Input       *Schema `yaml:"input,omitempty"`
-	Output      *Schema `yaml:"output,omitempty"`
+	Description string  `yaml:"description" json:"description"`
+	Input       *Schema `yaml:"input,omitempty" json:"input,omitempty"`
+	Output      *Schema `yaml:"output,omitempty" json:"output,omitempty"`
 }
 
 // Schema is a simplified JSON Schema
 type Schema struct {
-	Type       string             `yaml:"type,omitempty"`
-	Properties map[string]*Schema `yaml:"properties,omitempty"`
-	Required   []string           `yaml:"required,omitempty"`
-	Items      *Schema            `yaml:"items,omitempty"`
-	Default    interface{}        `yaml:"default,omitempty"`
-	Desc       string             `yaml:"description,omitempty"`
+	Type       string             `yaml:"type,omitempty" json:"type,omitempty"`
+	Properties map[string]*Schema `yaml:"properties,omitempty" json:"properties,omitempty"`
+	Required   []string           `yaml:"required,omitempty" json:"required,omitempty"`
+	Items      *Schema            `yaml:"items,omitempty" json:"items,omitempty"`
+	Default    interface{}        `yaml:"default,omitempty" json:"default,omitempty"`
+	Desc       string             `yaml:"description,omitempty" json:"description,omitempty"`
 }
 
 // Health defines health check configuration

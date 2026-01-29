@@ -6,11 +6,28 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/richinsley/jumpboot"
 )
+
+// CallResponse represents the response from a jb-service call
+type CallResponse struct {
+	OK     bool                   `json:"ok"`
+	Result interface{}            `json:"result,omitempty"`
+	Error  *CallError             `json:"error,omitempty"`
+	Done   bool                   `json:"done"`
+	Chunk  interface{}            `json:"chunk,omitempty"` // For future streaming support
+}
+
+// CallError represents an error from a jb-service call
+type CallError struct {
+	Type      string `json:"type"`
+	Message   string `json:"message"`
+	Traceback string `json:"traceback,omitempty"`
+}
 
 // Executor handles RPC calls to tools using jumpboot
 type Executor struct {
@@ -30,13 +47,13 @@ func NewExecutor(manager *Manager) *Executor {
 }
 
 // Call executes a method on a tool
-func (e *Executor) Call(toolName, methodName string, params map[string]interface{}) (map[string]interface{}, error) {
+func (e *Executor) Call(toolName, methodName string, params map[string]interface{}) (interface{}, error) {
 	tool, ok := e.manager.Get(toolName)
 	if !ok {
 		return nil, fmt.Errorf("tool not found: %s", toolName)
 	}
 
-	// Validate method exists
+	// Validate method exists in manifest
 	method, ok := tool.Manifest.RPC.Methods[methodName]
 	if !ok {
 		return nil, fmt.Errorf("method not found: %s", methodName)
@@ -54,56 +71,28 @@ func (e *Executor) Call(toolName, methodName string, params map[string]interface
 	return e.callOneshot(tool, methodName, params)
 }
 
-// callOneshot runs a tool for a single call using JSONQueue
-func (e *Executor) callOneshot(tool *Tool, methodName string, params map[string]interface{}) (map[string]interface{}, error) {
+// callOneshot runs a tool for a single call using jb-service protocol
+func (e *Executor) callOneshot(tool *Tool, methodName string, params map[string]interface{}) (interface{}, error) {
 	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
 
-	// Create module from tool's entrypoint
-	mod, err := jumpboot.NewModuleFromPath(tool.Name, entrypoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load module: %w", err)
-	}
-
-	// Create REPL process with JSONQueue
-	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, []jumpboot.Module{*mod}, nil)
+	// Create REPL process - no module needed, we run main.py directly
+	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create REPL: %w", err)
 	}
 	defer repl.Close()
 
-	// Import the tool module
-	_, err = repl.Execute(fmt.Sprintf("import %s", tool.Name), true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to import tool: %w", err)
+	// Start the service by executing main.py
+	if err := e.initializeService(repl, entrypoint, tool.Manifest.Runtime.StartupTimeout); err != nil {
+		return nil, err
 	}
 
-	// Build the call - use JSONQueue for structured communication
-	paramsJSON, _ := json.Marshal(params)
-	callExpr := fmt.Sprintf("%s.%s(**%s)", tool.Name, methodName, string(paramsJSON))
-
-	result, err := repl.Execute(callExpr, true)
-	if err != nil {
-		return nil, fmt.Errorf("call failed: %w", err)
-	}
-
-	// Parse result - handle potential string quoting from REPL
-	resultStr := result
-	// Strip outer quotes if present (REPL returns quoted strings)
-	if len(resultStr) >= 2 && resultStr[0] == '\'' && resultStr[len(resultStr)-1] == '\'' {
-		resultStr = resultStr[1 : len(resultStr)-1]
-	}
-	
-	var response map[string]interface{}
-	if err := json.Unmarshal([]byte(resultStr), &response); err != nil {
-		// If not JSON, wrap in result
-		return map[string]interface{}{"result": result}, nil
-	}
-
-	return response, nil
+	// Make the call using __jb_call__
+	return e.doCall(repl, methodName, params)
 }
 
 // callPersistent calls a method on a running persistent tool
-func (e *Executor) callPersistent(tool *Tool, methodName string, params map[string]interface{}) (map[string]interface{}, error) {
+func (e *Executor) callPersistent(tool *Tool, methodName string, params map[string]interface{}) (interface{}, error) {
 	e.mu.RLock()
 	repl, ok := e.repls[tool.Name]
 	e.mu.RUnlock()
@@ -112,27 +101,113 @@ func (e *Executor) callPersistent(tool *Tool, methodName string, params map[stri
 		return nil, fmt.Errorf("tool %s is not running, start it first", tool.Name)
 	}
 
-	// Build the call
-	paramsJSON, _ := json.Marshal(params)
-	callExpr := fmt.Sprintf("%s.%s(**%s)", tool.Name, methodName, string(paramsJSON))
+	return e.doCall(repl, methodName, params)
+}
 
+// initializeService runs the tool's main.py and waits for __JB_READY__
+func (e *Executor) initializeService(repl *jumpboot.REPLPythonProcess, entrypoint string, timeoutSec int) error {
+	// Execute the entrypoint file with __name__ set to "__main__"
+	// This is required for the `if __name__ == "__main__": run(Service)` pattern
+	// The run() function registers __jb_call__ etc. in builtins
+	initCode := fmt.Sprintf(`
+__name__ = "__main__"
+exec(open(%q).read())
+`, entrypoint)
+	
+	_, err := repl.Execute(initCode, true)
+	if err != nil {
+		return fmt.Errorf("failed to run entrypoint: %w", err)
+	}
+
+	// Import __jb_call__ from builtins into the REPL's namespace
+	// This makes it directly callable without the builtins prefix
+	importCode := `
+import builtins
+if hasattr(builtins, '__jb_call__'):
+    __jb_call__ = builtins.__jb_call__
+    __jb_schema__ = builtins.__jb_schema__
+    __jb_methods__ = builtins.__jb_methods__
+    __jb_shutdown__ = builtins.__jb_shutdown__
+`
+	_, err = repl.Execute(importCode, true)
+	if err != nil {
+		return fmt.Errorf("failed to import jb functions: %w", err)
+	}
+
+	// Check that __jb_call__ is available
+	checkCode := `"ready" if callable(globals().get("__jb_call__")) else "not ready"`
+	result, err := repl.Execute(checkCode, true)
+	if err != nil {
+		return fmt.Errorf("failed to check service status: %w", err)
+	}
+
+	if !strings.Contains(result, "ready") {
+		return fmt.Errorf("service did not initialize properly: __jb_call__ not found")
+	}
+
+	return nil
+}
+
+// doCall executes a method using the __jb_call__ protocol
+func (e *Executor) doCall(repl *jumpboot.REPLPythonProcess, methodName string, params map[string]interface{}) (interface{}, error) {
+	if params == nil {
+		params = make(map[string]interface{})
+	}
+
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal params: %w", err)
+	}
+
+	// Call __jb_call__(method, params)
+	callExpr := fmt.Sprintf(`__jb_call__(%q, %s)`, methodName, string(paramsJSON))
+	
 	result, err := repl.Execute(callExpr, true)
 	if err != nil {
 		return nil, fmt.Errorf("call failed: %w", err)
 	}
 
-	// Strip outer quotes if present
-	resultStr := result
-	if len(resultStr) >= 2 && resultStr[0] == '\'' && resultStr[len(resultStr)-1] == '\'' {
-		resultStr = resultStr[1 : len(resultStr)-1]
-	}
+	// Parse the response
+	return e.parseResponse(result)
+}
+
+// parseResponse parses a jb-service response
+func (e *Executor) parseResponse(result string) (interface{}, error) {
+	// Clean up the result string - REPL may return quoted strings
+	resultStr := strings.TrimSpace(result)
 	
-	var response map[string]interface{}
-	if err := json.Unmarshal([]byte(resultStr), &response); err != nil {
-		return map[string]interface{}{"result": result}, nil
+	// Remove outer quotes if present
+	if len(resultStr) >= 2 {
+		if (resultStr[0] == '\'' && resultStr[len(resultStr)-1] == '\'') ||
+			(resultStr[0] == '"' && resultStr[len(resultStr)-1] == '"') {
+			resultStr = resultStr[1 : len(resultStr)-1]
+		}
 	}
 
-	return response, nil
+	// Handle Python string escaping
+	resultStr = strings.ReplaceAll(resultStr, `\'`, `'`)
+	resultStr = strings.ReplaceAll(resultStr, `\"`, `"`)
+
+	// Parse as CallResponse
+	var resp CallResponse
+	if err := json.Unmarshal([]byte(resultStr), &resp); err != nil {
+		// If not valid JSON, return raw result
+		return result, nil
+	}
+
+	// Check for error
+	if !resp.OK {
+		if resp.Error != nil {
+			errMsg := fmt.Sprintf("%s: %s", resp.Error.Type, resp.Error.Message)
+			if resp.Error.Traceback != "" {
+				errMsg += "\n" + resp.Error.Traceback
+			}
+			return nil, fmt.Errorf(errMsg)
+		}
+		return nil, fmt.Errorf("call failed with unknown error")
+	}
+
+	return resp.Result, nil
 }
 
 // Start starts a persistent tool
@@ -158,22 +233,16 @@ func (e *Executor) Start(toolName string) error {
 		return err
 	}
 
-	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
-	mod, err := jumpboot.NewModuleFromPath(tool.Name, entrypoint)
-	if err != nil {
-		return fmt.Errorf("failed to load module: %w", err)
-	}
-
-	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, []jumpboot.Module{*mod}, nil)
+	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create REPL: %w", err)
 	}
 
-	// Import the tool module
-	_, err = repl.Execute(fmt.Sprintf("import %s", tool.Name), true)
-	if err != nil {
+	// Initialize the service
+	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
+	if err := e.initializeService(repl, entrypoint, tool.Manifest.Runtime.StartupTimeout); err != nil {
 		repl.Close()
-		return fmt.Errorf("failed to import tool: %w", err)
+		return fmt.Errorf("failed to initialize service: %w", err)
 	}
 
 	e.repls[toolName] = repl
@@ -188,7 +257,7 @@ func (e *Executor) Start(toolName string) error {
 		go e.runHealthCheck(ctx, tool)
 	}
 
-	fmt.Printf("Started %s\n", toolName)
+	log.Printf("Started %s", toolName)
 	return nil
 }
 
@@ -219,7 +288,7 @@ func (e *Executor) Stop(toolName string) error {
 	tool.HealthStatus = ""
 	tool.HealthFailures = 0
 
-	fmt.Printf("Stopped %s\n", toolName)
+	log.Printf("Stopped %s", toolName)
 	return nil
 }
 
@@ -283,7 +352,7 @@ func (e *Executor) runHealthCheck(ctx context.Context, tool *Tool) {
 	}
 }
 
-// doHealthCheck performs a single health check call
+// doHealthCheck performs a single health check call using __jb_call__
 func (e *Executor) doHealthCheck(tool *Tool, method string) error {
 	e.mu.RLock()
 	repl, ok := e.repls[tool.Name]
@@ -293,28 +362,84 @@ func (e *Executor) doHealthCheck(tool *Tool, method string) error {
 		return fmt.Errorf("tool not running")
 	}
 
-	// Call the health method
-	callExpr := fmt.Sprintf("%s.%s()", tool.Name, method)
-	result, err := repl.Execute(callExpr, true)
+	// Call the health method via __jb_call__
+	result, err := e.doCall(repl, method, nil)
 	if err != nil {
 		return fmt.Errorf("health call failed: %w", err)
 	}
 
-	// Parse result and check status
-	resultStr := result
-	if len(resultStr) >= 2 && resultStr[0] == '\'' && resultStr[len(resultStr)-1] == '\'' {
-		resultStr = resultStr[1 : len(resultStr)-1]
+	// Check for "ok" or "status: ok" in result
+	if resultMap, ok := result.(map[string]interface{}); ok {
+		if status, ok := resultMap["status"].(string); ok && status == "ok" {
+			return nil
+		}
 	}
 
-	var response map[string]interface{}
-	if err := json.Unmarshal([]byte(resultStr), &response); err != nil {
-		return fmt.Errorf("invalid health response: %w", err)
-	}
-
-	// Check for "ok" status
-	if status, ok := response["status"].(string); ok && status == "ok" {
+	// Also accept simple "ok" string
+	if resultStr, ok := result.(string); ok && resultStr == "ok" {
 		return nil
 	}
 
-	return fmt.Errorf("unhealthy status: %v", response)
+	return fmt.Errorf("unhealthy status: %v", result)
+}
+
+// GetSchema returns the schema for a tool (via __jb_schema__)
+func (e *Executor) GetSchema(toolName string) (map[string]interface{}, error) {
+	tool, ok := e.manager.Get(toolName)
+	if !ok {
+		return nil, fmt.Errorf("tool not found: %s", toolName)
+	}
+
+	// For persistent tools, use running REPL
+	if tool.Manifest.Runtime.Mode == "persistent" {
+		e.mu.RLock()
+		repl, ok := e.repls[toolName]
+		e.mu.RUnlock()
+
+		if ok && repl != nil {
+			return e.getSchemaFromRepl(repl)
+		}
+	}
+
+	// For oneshot or stopped persistent, create temporary REPL
+	if err := e.manager.EnsureEnvironment(tool); err != nil {
+		return nil, err
+	}
+
+	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer repl.Close()
+
+	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
+	if err := e.initializeService(repl, entrypoint, tool.Manifest.Runtime.StartupTimeout); err != nil {
+		return nil, err
+	}
+
+	return e.getSchemaFromRepl(repl)
+}
+
+// getSchemaFromRepl gets schema using __jb_schema__
+func (e *Executor) getSchemaFromRepl(repl *jumpboot.REPLPythonProcess) (map[string]interface{}, error) {
+	result, err := repl.Execute("__jb_schema__()", true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schema: %w", err)
+	}
+
+	resultStr := strings.TrimSpace(result)
+	if len(resultStr) >= 2 {
+		if (resultStr[0] == '\'' && resultStr[len(resultStr)-1] == '\'') ||
+			(resultStr[0] == '"' && resultStr[len(resultStr)-1] == '"') {
+			resultStr = resultStr[1 : len(resultStr)-1]
+		}
+	}
+	resultStr = strings.ReplaceAll(resultStr, `\'`, `'`)
+
+	var schema map[string]interface{}
+	if err := json.Unmarshal([]byte(resultStr), &schema); err != nil {
+		return nil, fmt.Errorf("failed to parse schema: %w", err)
+	}
+
+	return schema, nil
 }

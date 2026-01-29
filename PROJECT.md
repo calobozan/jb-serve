@@ -4,104 +4,77 @@
 
 A generic server that hosts multiple Python tools, each with its own isolated environment. Tools are git repos with manifests that describe their capabilities, dependencies, and RPC interface. An agent (AI or human) can discover available tools and call them via CLI or HTTP API.
 
-## Current State (Phase 1 ✅)
+## Current State
 
-### What We Have
+### Phase 1 ✅ — Core Infrastructure
+- Go binary with CLI and HTTP API
+- Jumpboot integration for isolated Python environments
+- Tool installation from git or local path
+- Oneshot execution working
 
-**jb-serve** (`github.com/calobozan/jb-serve`)
-- Go binary that manages Python tools using jumpboot
-- CLI commands: `install`, `list`, `info`, `schema`, `call`, `start`, `stop`, `serve`
-- HTTP API: `/v1/tools`, `/v1/tools/{name}`, `/v1/tools/{name}/{method}`
-- Uses `jumpboot.CreateEnvironmentMamba()` for isolated Python environments
-- Uses `jumpboot.NewREPLPythonProcess()` for executing tool methods
-- Oneshot mode working (spins up REPL per call)
+### Phase 2 ✅ — Python SDK (jb-service)
+- **jb-service** Python package for tool authors
+- Simple API: `Service` base class + `@method` decorator
+- Pydantic validation for inputs
+- Async method support
+- `__jb_call__` protocol wired up between Go and Python
 
-**jb-calculator** (`github.com/calobozan/jb-calculator`)
-- Reference tool demonstrating the manifest format
-- Methods: add, subtract, multiply, divide, eval
-- Python 3.11, no external dependencies
+---
 
-**Manifest Format** (`jumpboot.yaml`)
-```yaml
-name: tool-name
-version: 1.0.0
-description: What the tool does
-capabilities:
-  - what it can do (for agent discovery)
-runtime:
-  python: "3.11"
-  mode: oneshot | persistent
-  packages: [pip-packages]
-  conda_packages: [conda-packages]
-  requirements: requirements.txt
-rpc:
-  methods:
-    method_name:
-      description: "What it does"
-      input:
-        type: object
-        properties: { ... }
-        required: [...]
-      output:
-        type: object
-        properties: { ... }
+## Repositories
+
+| Repo | Description |
+|------|-------------|
+| `github.com/calobozan/jb-serve` | Go server/CLI |
+| `github.com/calobozan/jb-service` | Python SDK for tool authors |
+| `github.com/calobozan/jb-calculator` | Reference oneshot tool (old style) |
+| `~/projects/jb-calculator-new` | Reference tool using jb-service |
+
+---
+
+## Creating a Tool (with jb-service)
+
+**main.py:**
+```python
+from jb_service import Service, method, run
+
+class Calculator(Service):
+    name = "calculator"
+    version = "1.0.0"
+    
+    @method
+    def add(self, a: float, b: float) -> float:
+        """Add two numbers."""
+        return a + b
+
+if __name__ == "__main__":
+    run(Calculator)
 ```
 
-### What Works
-- ✅ Install tools from local path or git URL
-- ✅ List installed tools with status
-- ✅ Get tool info and method schemas
-- ✅ Call oneshot tool methods via CLI
-- ✅ Schema-aware parameter type conversion
-- ✅ HTTP API for programmatic access
-- ✅ Jumpboot environment creation (micromamba)
-- ✅ Pip package installation
+**jumpboot.yaml:**
+```yaml
+name: calculator
+version: 1.0.0
+description: A simple calculator
 
-### Known Limitations
-- Persistent mode (long-running tools) not fully tested
-- Debug output from jumpboot REPL shows in output
-- No auth on HTTP API yet
-- Limited CLI parameter flags (hardcoded common ones)
+runtime:
+  python: "3.11"
+  mode: oneshot
+  packages:
+    - pydantic>=2.0
+    - git+https://github.com/calobozan/jb-service.git
 
----
+rpc:
+  methods:
+    add:
+      description: Add two numbers
+```
 
-## Phase 2: Robustness & Persistent Tools
-
-### Goals
-- [ ] Persistent tool mode working reliably
-- [x] Suppress jumpboot debug output (using calobozan/jumpboot fork, PR #2 upstream)
-- [ ] Dynamic CLI flags from schema
-- [ ] Auth token support for HTTP API
-- [ ] Better error handling and reporting
-- [ ] Health checks for persistent tools
-
----
-
-## Phase 3: Real Tools
-
-### Goals
-Build actual useful tools:
-- [ ] **jb-whisper** - Audio transcription (whisper)
-- [ ] **jb-embed** - Text embeddings (sentence-transformers) 
-- [ ] **jb-sdxl** - Image generation (diffusers)
-- [ ] **jb-llama** - LLM inference (llama.cpp or similar)
-
-Each demonstrates different patterns:
-- Whisper: File input, GPU optional
-- Embed: Batch processing, model loading
-- SDXL: Heavy GPU, long generation
-- Llama: Streaming output, conversation state
-
----
-
-## Phase 4: Advanced Features
-
-### Goals
-- [ ] Tool hot-reload without restart
-- [ ] GPU resource tracking
-- [ ] LRU environment eviction (for memory)
-- [ ] Tool registry/discovery service
-- [ ] Moltbot integration (as a skill or tool source)
+**Install and use:**
+```bash
+jb-serve install ./my-tool
+jb-serve call calculator.add a=5 b=3  # → 8
+```
 
 ---
 
@@ -109,72 +82,102 @@ Each demonstrates different patterns:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  jb-serve                                               │
+│  jb-serve (Go)                                          │
 │  ├── CLI (cobra)                                        │
 │  ├── HTTP API (net/http)                                │
-│  ├── Tool Manager                                       │
-│  │   ├── Install (git clone + manifest parse)          │
-│  │   ├── Environment (jumpboot.CreateEnvironmentMamba) │
-│  │   └── Registry (tracks installed tools)             │
+│  ├── Tool Manager (install, list, info)                 │
 │  └── Executor                                           │
-│      ├── Oneshot (new REPL per call)                   │
-│      └── Persistent (keep REPL alive)                  │
+│      ├── initializeService() — runs main.py            │
+│      ├── doCall() — calls __jb_call__(method, params)  │
+│      └── parseResponse() — JSON response handling      │
 └─────────────────────────────────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────┐
-│  jumpboot (github.com/richinsley/jumpboot)              │
-│  ├── CreateEnvironmentMamba (micromamba envs)           │
-│  ├── PipInstallPackages                                 │
-│  └── NewREPLPythonProcess (Python execution)            │
+│  jumpboot REPL                                          │
+│  ├── Executes Python code sent from Go                 │
+│  └── Returns results via stdout                        │
 └─────────────────────────────────────────────────────────┘
                           │
                           ▼
-┌──────────┐  ┌──────────┐  ┌──────────┐
-│calculator│  │ whisper  │  │  sdxl    │  ...
-│ (py3.11) │  │ (py3.10) │  │ (py3.10) │
-└──────────┘  └──────────┘  └──────────┘
+┌─────────────────────────────────────────────────────────┐
+│  jb-service (Python)                                    │
+│  ├── Service base class                                │
+│  ├── @method decorator                                 │
+│  ├── run() — registers __jb_call__ in builtins        │
+│  └── Protocol — handles calls, returns JSON           │
+└─────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Next Up (Phase 3)
+
+### Binary File Handling
+Design doc: `docs/BINARY-HANDLING.md`
+
+For tools like jb-whisper (audio in) and jb-sdxl (images out), we need:
+- File input via path/url/base64
+- File output with managed references
+- `/v1/files/{ref}` endpoint for retrieval
+
+### Candidates
+- [ ] jb-whisper — Audio transcription (needs binary input)
+- [ ] Auto-restart on health failure
+- [ ] CLI daemon mode
+- [ ] Re-enable structured logging (disabled due to REPL interference)
+
+---
 
 ## Key Files
 
 ```
 ~/projects/jb-serve/
-├── cmd/jb-serve/main.go     # CLI entry point
+├── cmd/jb-serve/main.go
 ├── internal/
 │   ├── config/
-│   │   ├── config.go        # Global config (~/.jb-serve/)
-│   │   └── manifest.go      # jumpboot.yaml schema
+│   │   ├── config.go
+│   │   └── manifest.go
 │   ├── tools/
-│   │   ├── manager.go       # Tool install/registry
-│   │   └── executor.go      # Method execution
+│   │   ├── manager.go
+│   │   └── executor.go      # __jb_call__ protocol here
 │   └── server/
-│       └── server.go        # HTTP API
-└── PROJECT.md               # This file
+│       └── server.go
+├── docs/
+│   ├── PYTHON-SDK.md        # jb-service documentation
+│   └── BINARY-HANDLING.md   # File I/O design (not yet implemented)
+└── PROJECT.md
 
-~/projects/jb-calculator/
-├── jumpboot.yaml            # Tool manifest
-└── main.py                  # Python implementation
+~/projects/jb-service/
+├── src/jb_service/
+│   ├── __init__.py
+│   ├── service.py           # Service base class
+│   ├── method.py            # @method decorator
+│   ├── protocol.py          # run(), __jb_call__
+│   └── schema.py            # Pydantic → JSON schema
+├── examples/calculator.py
+└── tests/
 ```
 
-## Usage Examples
+---
+
+## Usage
 
 ```bash
-# Install
-jb-serve install github.com/calobozan/jb-calculator
-jb-serve install ~/projects/my-tool
+# Install a tool
+jb-serve install ~/projects/jb-calculator-new
+jb-serve install github.com/someone/their-tool
 
-# Discover
+# List tools
 jb-serve list
-jb-serve info calculator
-jb-serve schema calculator.add
 
-# Call
-jb-serve call calculator.add --a 2 --b 3
-jb-serve call calculator.eval --expression "2+3*4"
+# Call methods
+jb-serve call calculator.add a=5 b=3
+jb-serve call calculator.divide a=10 b=2
 
-# HTTP
+# HTTP API
 jb-serve serve --port 9800
-curl http://localhost:9800/v1/tools
-curl -X POST http://localhost:9800/v1/tools/calculator/add -d '{"a":2,"b":3}'
+curl -X POST http://localhost:9800/v1/tools/calculator/add \
+  -H "Content-Type: application/json" \
+  -d '{"a": 5, "b": 3}'
 ```

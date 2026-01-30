@@ -57,6 +57,9 @@ curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
 # Start/stop persistent tools
 curl -X POST http://192.168.0.107:9800/v1/tools/whisper/start
 curl -X POST http://192.168.0.107:9800/v1/tools/whisper/stop
+
+# Get generated files
+curl -o output.png http://192.168.0.107:9800/v1/files/{ref}.png
 ```
 
 ### Check Server Status
@@ -89,6 +92,55 @@ ssh calo@192.168.0.107 "sudo apt-get install -y ffmpeg"
 - Async method support
 - `__jb_call__` protocol wired up between Go and Python
 
+### Phase 3 ✅ — MessagePack Transport
+- **Two transport modes**: REPL (default) and MessagePack
+- `runtime.transport: msgpack` in manifest enables MessagePack
+- `MessagePackService` base class in jb-service for stdout-safe tools
+- Jumpboot's `QueueProcess` for binary-safe RPC (no stdout interference)
+- Perfect for tools with progress bars, tqdm, or verbose libraries
+
+---
+
+## Transport Modes
+
+### REPL Transport (default)
+- Uses jumpboot's REPL for Python execution
+- Simple, works for most tools
+- **Caveat**: Stdout must be clean (no progress bars, prints)
+
+```yaml
+runtime:
+  python: "3.11"
+  mode: persistent
+  # transport defaults to "repl"
+```
+
+### MessagePack Transport
+- Uses jumpboot's `QueueProcess` with MessagePack serialization
+- Stdout/stderr are completely separate from RPC
+- Progress bars, tqdm, logging all work fine
+
+```yaml
+runtime:
+  python: "3.11"
+  mode: persistent
+  transport: msgpack  # Enable MessagePack
+```
+
+**Python side:**
+```python
+from jb_service import MessagePackService, method, run
+
+class MyTool(MessagePackService):  # Note: MessagePackService, not Service
+    @method
+    def generate(self, prompt: str) -> dict:
+        # tqdm progress bars work fine here!
+        ...
+
+if __name__ == "__main__":
+    run(MyTool)
+```
+
 ---
 
 ## Repositories
@@ -100,15 +152,17 @@ ssh calo@192.168.0.107 "sudo apt-get install -y ffmpeg"
 | `github.com/calobozan/jb-calculator` | Reference oneshot tool (old style) |
 | `~/projects/jb-calculator-new` | Reference tool using jb-service |
 | `~/projects/jb-whisper` | Audio transcription tool (Whisper) |
-| `~/projects/jb-z-image-turbo` | Image generation (Z-Image-Turbo) |
+| `~/projects/jb-z-image-turbo` | Image generation (Z-Image-Turbo, uses MessagePack) |
 
 ---
 
 ## Creating a Tool (with jb-service)
 
+### Basic Tool (REPL transport)
+
 **main.py:**
 ```python
-from jb_service import Service, method, run, FilePath, Audio, Image
+from jb_service import Service, method, run
 
 class Calculator(Service):
     name = "calculator"
@@ -121,6 +175,45 @@ class Calculator(Service):
 
 if __name__ == "__main__":
     run(Calculator)
+```
+
+### Tool with Progress Bars (MessagePack transport)
+
+**main.py:**
+```python
+from jb_service import MessagePackService, method, run, save_image
+
+class ImageGenerator(MessagePackService):
+    name = "image-gen"
+    version = "1.0.0"
+    
+    def setup(self):
+        from diffusers import SomePipeline
+        self.pipe = SomePipeline.from_pretrained(...)  # Progress bars OK!
+    
+    @method
+    def generate(self, prompt: str) -> dict:
+        result = self.pipe(prompt)  # tqdm progress bars OK!
+        path = save_image(result.images[0])
+        return {"image": path}
+
+if __name__ == "__main__":
+    run(ImageGenerator)
+```
+
+**jumpboot.yaml:**
+```yaml
+name: image-gen
+version: 1.0.0
+
+runtime:
+  python: "3.11"
+  mode: persistent
+  transport: msgpack  # Enable MessagePack for stdout-safe operation
+  packages:
+    - diffusers
+    - torch
+    - git+https://github.com/calobozan/jb-service.git
 ```
 
 ### File Input Types
@@ -136,52 +229,18 @@ class MediaProcessor(Service):
     @method
     def transcribe(self, audio: FilePath) -> dict:
         # audio = "/path/to/file.wav" (string path)
-        # Use when your library handles file loading (like whisper)
         ...
     
     @method
     def analyze_audio(self, audio: Audio) -> dict:
         # audio = (sample_rate, numpy_array)
-        # Pre-loaded by jb-service using soundfile/scipy/librosa
         sample_rate, data = audio
         ...
     
     @method
     def describe_image(self, image: Image) -> dict:
         # image = PIL.Image
-        # Pre-loaded by jb-service using Pillow
-        width, height = image.size
         ...
-```
-
-**Available types:**
-- `FilePath` — Pass path as string (no loading)
-- `Audio` — Load as `(sample_rate, numpy_array)` tuple
-- `Image` — Load as `PIL.Image`
-
-**jumpboot.yaml:**
-```yaml
-name: calculator
-version: 1.0.0
-description: A simple calculator
-
-runtime:
-  python: "3.11"
-  mode: oneshot
-  packages:
-    - pydantic>=2.0
-    - git+https://github.com/calobozan/jb-service.git
-
-rpc:
-  methods:
-    add:
-      description: Add two numbers
-```
-
-**Install and use:**
-```bash
-jb-serve install ./my-tool
-jb-serve call calculator.add a=5 b=3  # → 8
 ```
 
 ---
@@ -195,70 +254,57 @@ jb-serve call calculator.add a=5 b=3  # → 8
 │  ├── HTTP API (net/http)                                │
 │  ├── Tool Manager (install, list, info)                 │
 │  └── Executor                                           │
-│      ├── initializeService() — runs main.py            │
-│      ├── doCall() — calls __jb_call__(method, params)  │
-│      └── parseResponse() — JSON response handling      │
+│      ├── REPL transport (default)                       │
+│      │   └── initializeService() + doCall()             │
+│      └── MessagePack transport                          │
+│          └── QueueProcess with register_handler()       │
 └─────────────────────────────────────────────────────────┘
                           │
-                          ▼
-┌─────────────────────────────────────────────────────────┐
-│  jumpboot REPL                                          │
-│  ├── Executes Python code sent from Go                 │
-│  └── Returns results via stdout                        │
-└─────────────────────────────────────────────────────────┘
-                          │
-                          ▼
+         ┌────────────────┴────────────────┐
+         ▼                                 ▼
+┌─────────────────────┐         ┌─────────────────────┐
+│  jumpboot REPL      │         │  jumpboot Queue     │
+│  (stdout = data)    │         │  (msgpack pipes)    │
+└─────────────────────┘         └─────────────────────┘
+         │                                 │
+         ▼                                 ▼
 ┌─────────────────────────────────────────────────────────┐
 │  jb-service (Python)                                    │
-│  ├── Service base class                                │
+│  ├── Service — REPL transport                          │
+│  ├── MessagePackService — MessagePack transport        │
 │  ├── @method decorator                                 │
-│  ├── run() — registers __jb_call__ in builtins        │
-│  └── Protocol — handles calls, returns JSON           │
+│  └── run() — auto-detects transport from service class │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Next Up (Phase 3)
+## File Handling
 
-### Completed
-- [x] **jb-whisper** — Audio transcription tool working (deployed on GPU server)
-  - Uses file paths directly (no complex FileRef abstraction needed)
-  - Persistent mode with model kept loaded
-  - Works via HTTP API: `POST /v1/tools/whisper/transcribe {"audio": "/path/to/file.wav"}`
-  - Requires `ffmpeg` on the server: `sudo apt-get install ffmpeg`
-- [x] **Multipart file upload** — Upload files directly to tools from remote clients
-  - `curl -F "audio=@local-file.wav" -F 'params={...}'`
-  - Files saved to temp, cleaned up after call
-  - Works alongside JSON paths for server-local files
-- [x] **File type hints (jb-service)** — Declarative file handling in Python
-  - `FilePath` — pass path string (tool handles loading)
-  - `Audio` — pre-load as (sample_rate, numpy_array)
-  - `Image` — pre-load as PIL.Image
+### Output Files (FileRef)
+When tools return file paths, jb-serve wraps them as FileRef objects:
 
-### Binary Handling (Implemented)
-Simplified from the original `docs/BINARY-HANDLING.md` design:
+```json
+{
+  "image": {
+    "ref": "43af6f50",
+    "url": "/v1/files/43af6f50.png",
+    "path": "/home/calo/.jb-serve/outputs/43af6f50.png",
+    "size": 1211477,
+    "media_type": "image/png"
+  }
+}
+```
 
-**Input options:**
-1. **JSON with path** — file already on server: `{"audio": "/path/on/server.wav"}`
-2. **Multipart upload** — file sent from client: `-F "audio=@local.wav"`
+Fetch files via:
+```bash
+curl -o image.png http://192.168.0.107:9800/v1/files/43af6f50.png
+```
 
-**How it works:**
-- Server detects `multipart/form-data` content type
-- Saves uploaded files to `~/.jb-serve/uploads/`
-- Passes file path to tool (tool just sees a path)
-- Cleans up temp files after method returns
-
-**Not implemented (not needed yet):**
-- URL fetching (`{"audio": {"url": "https://..."}`)
-- Base64 inline (`{"audio": {"data": "base64..."}}`)
-- Managed output refs (`/v1/files/{ref}` endpoint)
-
-### Remaining Candidates
-- [ ] CLI daemon mode (so `jb-serve start` persists)
-- [ ] Auto-restart on health failure
-- [ ] Re-enable structured logging (disabled due to REPL interference)
-- [ ] jb-sdxl — Image generation (when ready)
+### Input Files
+Two options:
+1. **JSON with path** — file on server: `{"audio": "/path/on/server.wav"}`
+2. **Multipart upload** — file from client: `-F "audio=@local.wav"`
 
 ---
 
@@ -270,48 +316,73 @@ Simplified from the original `docs/BINARY-HANDLING.md` design:
 ├── internal/
 │   ├── config/
 │   │   ├── config.go
-│   │   └── manifest.go
+│   │   └── manifest.go          # Transport config
 │   ├── tools/
 │   │   ├── manager.go
-│   │   └── executor.go      # __jb_call__ protocol here
+│   │   └── executor.go          # REPL + MessagePack transports
+│   ├── files/
+│   │   └── files.go             # FileRef handling
 │   └── server/
-│       └── server.go
+│       └── server.go            # /v1/files endpoint
 ├── docs/
-│   ├── PYTHON-SDK.md        # jb-service documentation
-│   └── BINARY-HANDLING.md   # File I/O design (not yet implemented)
+│   ├── PYTHON-SDK.md
+│   └── BINARY-HANDLING.md
 └── PROJECT.md
 
 ~/projects/jb-service/
 ├── src/jb_service/
 │   ├── __init__.py
-│   ├── service.py           # Service base class
-│   ├── method.py            # @method decorator
-│   ├── protocol.py          # run(), __jb_call__
-│   └── schema.py            # Pydantic → JSON schema
-├── examples/calculator.py
+│   ├── service.py               # Service base class (REPL)
+│   ├── msgpack_service.py       # MessagePackService base class
+│   ├── msgpack_protocol.py      # MessagePack transport protocol
+│   ├── method.py                # @method decorator
+│   ├── protocol.py              # run(), auto-transport detection
+│   └── types.py                 # FilePath, Audio, Image, save_image()
 └── tests/
 ```
 
 ---
 
-## Usage (GPU Server)
+## Usage Examples
 
-See **Development Workflow** above for deployment steps.
-
+### Image Generation (z-image-turbo)
 ```bash
-# List tools on server
-curl http://192.168.0.107:9800/v1/tools
+# Start the tool
+curl -X POST http://192.168.0.107:9800/v1/tools/z-image-turbo/start
 
-# Start persistent tool
-curl -X POST http://192.168.0.107:9800/v1/tools/whisper/start
-
-# Call methods
-curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
+# Generate an image
+curl -X POST http://192.168.0.107:9800/v1/tools/z-image-turbo/generate \
   -H "Content-Type: application/json" \
-  -d '{"audio": "/path/on/server/audio.wav"}'
+  -d '{"prompt": "A peaceful meadow at sunset", "seed": 456}'
 
-# Stop tool
-curl -X POST http://192.168.0.107:9800/v1/tools/whisper/stop
+# Response includes FileRef:
+# {"image": {"ref": "52828c84", "url": "/v1/files/52828c84.png", ...}}
+
+# Download the image
+curl -o meadow.png http://192.168.0.107:9800/v1/files/52828c84.png
 ```
 
-**Note:** File paths in requests must be paths on the GPU server, not local paths.
+### Audio Transcription (whisper)
+```bash
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/start
+curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
+  -H "Content-Type: application/json" \
+  -d '{"audio": "/path/to/audio.wav"}'
+```
+
+---
+
+## Next Up
+
+### Completed
+- [x] **Phase 1**: Core infrastructure
+- [x] **Phase 2**: Python SDK (jb-service)
+- [x] **Phase 3**: MessagePack transport for stdout-safe tools
+- [x] **z-image-turbo**: Image generation with progress bars working
+- [x] **FileRef system**: Output files served via `/v1/files/{ref}`
+
+### Remaining Candidates
+- [ ] Convert jb-whisper to MessagePack (if needed)
+- [ ] CLI daemon mode (`jb-serve start` persists)
+- [ ] Auto-restart on health failure
+- [ ] Tool hot-reload without restart

@@ -1,16 +1,16 @@
 # jb-serve
 
-A service that hosts Python tools using [jumpboot](https://github.com/richinsley/jumpboot) as Go middleware for Python.
+A tool server that hosts Python tools using [jumpboot](https://github.com/richinsley/jumpboot) for isolated environments and seamless Go-Python communication.
 
-## Vision
+## Features
 
-**Jumpboot** is Go middleware for Python — it can create isolated Python environments, start/manage/communicate with multiple Python instances (each with different Python versions and packages) from a single Go binary.
+- **Isolated environments**: Each tool gets its own Python environment (via jumpboot/micromamba)
+- **Two execution modes**: Oneshot (per-call) or persistent (always-on with loaded models)
+- **Two transport modes**: REPL (simple) or MessagePack (stdout-safe for progress bars)
+- **HTTP API**: RESTful endpoints for tool discovery and execution
+- **File handling**: Upload inputs, download outputs via `/v1/files/{ref}`
 
-**jb-serve** uses jumpboot to provide a tool server that:
-- Accepts git repositories containing tool definitions (manifest + Python code)
-- Creates isolated Python environments for each tool automatically
-- Runs tools as **oneshot** services (launch → execute → shutdown) or **persistent** services (always-on)
-- Exposes an HTTP API for agents (AI or human) to discover, manage, and call tools
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -20,42 +20,19 @@ A service that hosts Python tools using [jumpboot](https://github.com/richinsley
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  jb-serve                                                           │
-│  ├── HTTP API (/v1/tools/...) with auth                             │
+│  ├── HTTP API (/v1/tools/...)                                       │
 │  ├── CLI (install, list, call, serve)                               │
-│  ├── Tool Manager (install from git, registry, environments)        │
-│  └── Executor (oneshot or persistent calls via jumpboot REPL)       │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  jumpboot (github.com/richinsley/jumpboot)                          │
-│  ├── micromamba (isolated Python environments)                      │
-│  ├── pip/conda package installation                                 │
-│  └── REPL (Python execution without subprocess spawn overhead)      │
+│  ├── Tool Manager (environments, health checks)                     │
+│  └── Executor (REPL or MessagePack transport)                       │
 └─────────────────────────────────────────────────────────────────────┘
                               │
           ┌───────────────────┼───────────────────┐
           ▼                   ▼                   ▼
    ┌────────────┐      ┌────────────┐      ┌────────────┐
-   │ calculator │      │  whisper   │      │    sdxl    │
-   │  (py3.11)  │      │  (py3.10)  │      │  (py3.10)  │
-   │  oneshot   │      │ persistent │      │ persistent │
+   │ calculator │      │  whisper   │      │ z-image    │
+   │  (oneshot) │      │(persistent)│      │ (msgpack)  │
    └────────────┘      └────────────┘      └────────────┘
 ```
-
-## Design Decisions
-
-These decisions were made early to keep scope manageable:
-
-> **Note:** Jumpboot's bootstrap code ensures that if the parent Go process terminates, all child Python processes are also terminated. This prevents orphan Python processes — no zombie cleanup required.
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| RPC Transport | HTTP | Universal — every language can call it. Auth layer included. |
-| Tool Discovery | CLI + HTTP | `jb-serve list --json` for local use, `/v1/tools` for agent queries |
-| Environment Management | Jumpboot only | Jumpboot manages all Python environments via micromamba. No pyenv/uv. |
-| Oneshot Cold Start | Pay cost every call | Simple first. Can optimize with warm pools later. |
-| GPU Scheduling | User's problem | Too complex for v1. Tool manifest can specify GPU requirements as hints. |
 
 ## Installation
 
@@ -73,247 +50,201 @@ go build -o jb-serve ./cmd/jb-serve
 ## Quick Start
 
 ```bash
-# Install a tool from git
+# Install a tool
 jb-serve install github.com/calobozan/jb-calculator
 
 # List installed tools
 jb-serve list
 
-# Call a method (oneshot - starts Python, runs, exits)
+# Call a method (oneshot)
 jb-serve call calculator.add a=2 b=3
-# {"result": 5}
 
-# Or with JSON
-jb-serve call calculator.add --json '{"a": 2, "b": 3}'
-
-# Start HTTP API for agent access
+# Start HTTP API
 jb-serve serve --port 9800
 ```
 
 ## Execution Modes
 
 ### Oneshot (default)
-- Fresh Python REPL created for each call
-- REPL closed after call completes
-- Best for: stateless tools, infrequent calls, low-memory environments
+Fresh Python process for each call. Best for stateless tools.
 
 ```bash
 jb-serve call calculator.add a=2 b=3
 ```
 
 ### Persistent
-- Python REPL stays alive between calls
-- Tool maintains state (loaded models, caches, connections)
-- Must be explicitly started/stopped
-- Best for: ML models, tools with expensive initialization (loading weights, warming up)
+Python process stays alive between calls. Best for ML models with expensive initialization.
 
 ```bash
-jb-serve start whisper           # Load model once
-jb-serve call whisper.transcribe --audio file.wav
-jb-serve call whisper.transcribe --audio another.wav  # Model already loaded
-jb-serve stop whisper            # Unload
+curl -X POST http://localhost:9800/v1/tools/whisper/start
+curl -X POST http://localhost:9800/v1/tools/whisper/transcribe -d '{"audio": "/path/to/file.wav"}'
+curl -X POST http://localhost:9800/v1/tools/whisper/stop
+```
+
+## Transport Modes
+
+### REPL (default)
+Simple stdout-based communication. Works for most tools.
+
+### MessagePack
+Binary protocol over pipes. Use when your tool has progress bars, tqdm, or writes to stdout.
+
+```yaml
+# jumpboot.yaml
+runtime:
+  python: "3.11"
+  mode: persistent
+  transport: msgpack  # Enable MessagePack
 ```
 
 ## Creating Tools
 
-A tool is a git repository containing:
-- `jumpboot.yaml` — Manifest describing environment and RPC interface
-- `main.py` — Python entrypoint with callable functions (or custom entrypoint)
+Tools use the [jb-service](https://github.com/calobozan/jb-service) Python SDK.
 
-### Manifest Format (`jumpboot.yaml`)
+### Basic Tool
 
-```yaml
-name: my-tool
-version: 1.0.0
-description: |
-  What this tool does. Can be multi-line.
-  Agents use this for discovery.
+**main.py:**
+```python
+from jb_service import Service, method, run
 
-# Capabilities for agent discovery - what can this tool do?
-capabilities:
-  - "transcribe audio to text"
-  - "supports 50+ languages"
-  - "GPU accelerated"
+class Calculator(Service):
+    @method
+    def add(self, a: float, b: float) -> float:
+        return a + b
 
-runtime:
-  python: "3.11"              # Python version
-  mode: oneshot               # "oneshot" or "persistent"
-  entrypoint: main.py         # Python file with functions (default: main.py)
-  startup_timeout: 60         # Seconds to wait for persistent tools to start
-  
-  # Package installation (in order: conda → pip → requirements.txt)
-  conda_packages:             # Installed via micromamba
-    - ffmpeg
-    - cudatoolkit=11.8
-  packages:                   # Installed via pip
-    - torch
-    - transformers
-  requirements: requirements.txt  # Optional requirements file
-
-# Resource hints (informational for now, may be used for scheduling later)
-resources:
-  gpu: true
-  vram_gb: 12
-  ram_gb: 16
-
-# RPC interface - what methods does this tool expose?
-rpc:
-  methods:
-    transcribe:
-      description: "Transcribe audio file to text"
-      input:
-        type: object
-        properties:
-          audio_path:
-            type: string
-            description: "Path to audio file"
-          language:
-            type: string
-            description: "Language code (auto-detect if omitted)"
-            default: null
-        required: [audio_path]
-      output:
-        type: object
-        properties:
-          text:
-            type: string
-          language:
-            type: string
-          duration_seconds:
-            type: number
-
-# Health check for persistent tools (optional)
-health:
-  method: health              # Method to call (default: "health")
-  interval: 30                # Seconds between checks (default: 30)
-  failure_threshold: 3        # Consecutive failures before unhealthy (default: 3)
+if __name__ == "__main__":
+    run(Calculator)
 ```
 
-### Python Implementation
+**jumpboot.yaml:**
+```yaml
+name: calculator
+version: 1.0.0
 
-Functions are called via jumpboot's REPL and must return JSON strings:
+runtime:
+  python: "3.11"
+  mode: oneshot
+  packages:
+    - git+https://github.com/calobozan/jb-service.git
 
+rpc:
+  methods:
+    add:
+      description: Add two numbers
+```
+
+### Tool with Progress Bars (MessagePack)
+
+**main.py:**
 ```python
-import json
+from jb_service import MessagePackService, method, run, save_image
 
-def transcribe(audio_path: str, language: str = None) -> str:
-    """Transcribe audio to text."""
-    # Your implementation here
-    result = {
-        "text": "Hello world",
-        "language": "en",
-        "duration_seconds": 3.5
-    }
-    return json.dumps(result)
+class ImageGenerator(MessagePackService):
+    def setup(self):
+        from diffusers import SomePipeline
+        self.pipe = SomePipeline.from_pretrained(...)  # Progress bars OK!
+    
+    @method
+    def generate(self, prompt: str) -> dict:
+        result = self.pipe(prompt)  # tqdm OK!
+        path = save_image(result.images[0])
+        return {"image": path}
 
-def health() -> str:
-    """Health check for persistent mode."""
-    return json.dumps({"status": "ok"})
+if __name__ == "__main__":
+    run(ImageGenerator)
+```
+
+**jumpboot.yaml:**
+```yaml
+name: image-gen
+version: 1.0.0
+
+runtime:
+  python: "3.11"
+  mode: persistent
+  transport: msgpack
+  packages:
+    - diffusers
+    - torch
+    - git+https://github.com/calobozan/jb-service.git
 ```
 
 ## HTTP API
 
-All endpoints return JSON. Use `Authorization: Bearer <token>` header when auth is configured.
-
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Server health check |
-| `/v1/tools` | GET | List all tools with capabilities |
-| `/v1/tools/{name}` | GET | Tool info and available methods |
-| `/v1/tools/{name}/schema` | GET | Full RPC schema for all methods |
-| `/v1/tools/{name}/start` | POST | Start a persistent tool |
-| `/v1/tools/{name}/stop` | POST | Stop a persistent tool |
-| `/v1/tools/{name}/{method}` | POST | Call a method with JSON body |
+| `/health` | GET | Server health |
+| `/v1/tools` | GET | List all tools |
+| `/v1/tools/{name}` | GET | Tool info |
+| `/v1/tools/{name}/start` | POST | Start persistent tool |
+| `/v1/tools/{name}/stop` | POST | Stop persistent tool |
+| `/v1/tools/{name}/{method}` | POST | Call a method |
+| `/v1/files/{ref}` | GET | Download output file |
 
 ### Examples
 
 ```bash
-# List tools (agent discovery)
+# List tools
 curl http://localhost:9800/v1/tools
 
-# Get tool info
-curl http://localhost:9800/v1/tools/calculator
+# Start a persistent tool
+curl -X POST http://localhost:9800/v1/tools/z-image-turbo/start
 
-# Call a method
-curl -X POST http://localhost:9800/v1/tools/calculator/add \
+# Generate an image
+curl -X POST http://localhost:9800/v1/tools/z-image-turbo/generate \
   -H "Content-Type: application/json" \
-  -d '{"a": 2, "b": 3}'
-# {"result": 5}
+  -d '{"prompt": "A meadow at sunset"}'
+# Response: {"image": {"ref": "abc123", "url": "/v1/files/abc123.png", ...}}
+
+# Download the image
+curl -o output.png http://localhost:9800/v1/files/abc123.png
+
+# Upload a file (multipart)
+curl -X POST http://localhost:9800/v1/tools/whisper/transcribe \
+  -F "audio=@local-file.wav"
 ```
+
+## File Handling
+
+### Outputs
+Methods returning file paths get wrapped as FileRef objects:
+
+```json
+{
+  "image": {
+    "ref": "43af6f50",
+    "url": "/v1/files/43af6f50.png",
+    "path": "/absolute/path/to/file.png",
+    "size": 1211477,
+    "media_type": "image/png"
+  }
+}
+```
+
+### Inputs
+Two options:
+1. **Server path**: `{"audio": "/path/on/server.wav"}`
+2. **Multipart upload**: `-F "audio=@local.wav"`
 
 ## CLI Reference
 
 ```bash
-# Tool management
-jb-serve install <git-url|path>   # Install tool from git repo or local path
-jb-serve list [--json]            # List installed tools
-jb-serve info <tool>              # Show tool details and methods
-jb-serve schema <tool>[.method]   # Show RPC schema
-
-# Execution
-jb-serve call <tool.method> [key=value ...]   # Call with key=value params
-jb-serve call <tool.method> --json '{...}'    # Call with JSON params
-jb-serve start <tool>             # Start a persistent tool
-jb-serve stop <tool>              # Stop a persistent tool
-
-# Server
-jb-serve serve [--port 9800]      # Start HTTP API server
+jb-serve install <url|path>       # Install tool
+jb-serve list                     # List tools
+jb-serve info <tool>              # Tool details
+jb-serve call <tool.method> ...   # Call method
+jb-serve start <tool>             # Start persistent
+jb-serve stop <tool>              # Stop persistent
+jb-serve serve --port 9800        # HTTP server
 ```
-
-## Configuration
-
-jb-serve stores data in `~/.jb-serve/`:
-
-```
-~/.jb-serve/
-├── config.yaml     # Optional configuration
-├── tools/          # Installed tools (cloned repos or symlinks)
-├── envs/           # Jumpboot Python environments
-└── run/            # Runtime state (PIDs, etc.)
-```
-
-### config.yaml
-
-```yaml
-tools_dir: ~/.jb-serve/tools
-envs_dir: ~/.jb-serve/envs
-run_dir: ~/.jb-serve/run
-api_port: 9800
-auth_token: "your-secret-token"  # Optional - enables auth on HTTP API
-```
-
-## Current Status
-
-### ✅ Working (v0.1.0)
-- [x] Install tools from git URL or local path
-- [x] Isolated Python environments via jumpboot/micromamba
-- [x] Oneshot execution (call → run → exit)
-- [x] Persistent tool mode (start → call → call → stop, state maintained)
-- [x] Health checks for persistent tools (configurable interval, failure threshold)
-- [x] HTTP API: all endpoints including `/start` and `/stop` for persistent tools
-- [x] CLI: `install`, `list`, `info`, `schema`, `call`, `start`, `stop`, `serve`
-- [x] Schema-aware parameter parsing (string → number/bool conversion)
-- [x] Auth token middleware (via config.yaml)
-- [x] Dynamic parameters via `key=value` syntax or `--json`
-
-### 🚧 In Progress
-- [ ] CLI `start`/`stop` with daemon mode (currently only works via HTTP server)
-
-### 📋 Planned
-- [ ] Better error messages and validation
-- [ ] GPU resource hints in scheduling
-- [ ] Tool hot-reload without restart
-- [ ] Warm pool for frequently-called oneshot tools
 
 ## Example Tools
 
-| Tool | Description | Mode |
-|------|-------------|------|
-| [jb-calculator](https://github.com/calobozan/jb-calculator) | Reference implementation — basic math | oneshot |
-| [jb-counter](https://github.com/calobozan/jb-counter) | Reference for persistent mode — stateful counter | persistent |
-| [jb-embed](https://github.com/calobozan/jb-embed) | Text embeddings via sentence-transformers | persistent |
-| jb-whisper | Audio transcription (planned) | persistent |
-| jb-sdxl | Image generation (planned) | persistent |
+| Tool | Description | Mode | Transport |
+|------|-------------|------|-----------|
+| [jb-calculator](https://github.com/calobozan/jb-calculator) | Basic math | oneshot | repl |
+| jb-whisper | Audio transcription | persistent | repl |
+| jb-z-image-turbo | Image generation | persistent | msgpack |
 
 ## License
 

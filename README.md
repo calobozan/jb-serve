@@ -47,20 +47,101 @@ cd jb-serve
 go build -o jb-serve ./cmd/jb-serve
 ```
 
-## Quick Start
+## Quickstart: Generate an Image
+
+This walkthrough installs jb-serve, adds an image generation tool, and generates your first image.
+
+### 1. Install jb-serve
 
 ```bash
-# Install a tool
-jb-serve install github.com/calobozan/jb-calculator
+# Install the binary
+go install github.com/calobozan/jb-serve/cmd/jb-serve@latest
 
+# Verify installation
+jb-serve --help
+```
+
+### 2. Install a tool
+
+Install the Z-Image-Turbo image generation tool (requires GPU with 16GB+ VRAM):
+
+```bash
+jb-serve install https://github.com/calobozan/jb-z-image-turbo
+```
+
+This will:
+- Create an isolated Python 3.11 environment
+- Install dependencies (torch, diffusers, transformers, etc.)
+- Download the model (~15GB) during setup
+- Register the tool with jb-serve
+
+### 3. Start the HTTP server
+
+```bash
+jb-serve serve --port 9800
+```
+
+### 4. Start the tool
+
+Persistent tools (like ML models) need to be started before use:
+
+```bash
+curl -X POST http://localhost:9800/v1/tools/z-image-turbo/start
+# {"status":"started","tool":"z-image-turbo"}
+```
+
+### 5. Generate an image
+
+```bash
+curl -X POST http://localhost:9800/v1/tools/z-image-turbo/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A serene mountain lake at sunset with snow-capped peaks"}'
+```
+
+Response:
+```json
+{
+  "image": {
+    "ref": "a1b2c3d4",
+    "url": "/v1/files/a1b2c3d4.png",
+    "path": "/tmp/jb-serve/outputs/a1b2c3d4.png",
+    "size": 1547832,
+    "media_type": "image/png"
+  },
+  "width": 1024,
+  "height": 1024,
+  "prompt": "A serene mountain lake at sunset with snow-capped peaks",
+  "seed": null
+}
+```
+
+### 6. Download the image
+
+```bash
+curl -o mountain-lake.png http://localhost:9800/v1/files/a1b2c3d4.png
+open mountain-lake.png  # macOS
+```
+
+### 7. Stop when done
+
+```bash
+curl -X POST http://localhost:9800/v1/tools/z-image-turbo/stop
+# {"status":"stopped","tool":"z-image-turbo"}
+```
+
+---
+
+## More Examples
+
+```bash
 # List installed tools
 jb-serve list
 
-# Call a method (oneshot)
-jb-serve call calculator.add a=2 b=3
+# Tool info and available methods
+jb-serve info z-image-turbo
 
-# Start HTTP API
-jb-serve serve --port 9800
+# Call via CLI (starts tool automatically)
+jb-serve call z-image-turbo.generate prompt="A cat in space"
 ```
 
 ## Execution Modes
@@ -242,9 +323,9 @@ jb-serve serve --port 9800        # HTTP server
 
 | Tool | Description | Mode | Transport |
 |------|-------------|------|-----------|
-| [jb-calculator](https://github.com/calobozan/jb-calculator) | Basic math | oneshot | repl |
-| jb-whisper | Audio transcription | persistent | repl |
-| jb-z-image-turbo | Image generation | persistent | msgpack |
+| [jb-whisper](https://github.com/calobozan/jb-whisper) | Audio transcription (OpenAI Whisper) | persistent | msgpack |
+| [jb-z-image-turbo](https://github.com/calobozan/jb-z-image-turbo) | Fast image generation (6B params, 8-step) | persistent | msgpack |
+| [jb-deepseek-ocr](https://github.com/calobozan/jb-deepseek-ocr) | Document OCR to Markdown | persistent | msgpack |
 
 ## License
 

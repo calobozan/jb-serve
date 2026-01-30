@@ -32,7 +32,8 @@ type CallError struct {
 // Executor handles RPC calls to tools using jumpboot
 type Executor struct {
 	manager       *Manager
-	repls         map[string]*jumpboot.REPLPythonProcess
+	repls         map[string]*jumpboot.REPLPythonProcess  // REPL transport
+	queues        map[string]*jumpboot.QueueProcess       // MessagePack transport
 	healthCancels map[string]context.CancelFunc
 	mu            sync.RWMutex
 }
@@ -42,6 +43,7 @@ func NewExecutor(manager *Manager) *Executor {
 	return &Executor{
 		manager:       manager,
 		repls:         make(map[string]*jumpboot.REPLPythonProcess),
+		queues:        make(map[string]*jumpboot.QueueProcess),
 		healthCancels: make(map[string]context.CancelFunc),
 	}
 }
@@ -65,6 +67,16 @@ func (e *Executor) Call(toolName, methodName string, params map[string]interface
 		return nil, fmt.Errorf("failed to ensure environment: %w", err)
 	}
 
+	// Route based on transport
+	transport := tool.Manifest.Runtime.Transport
+	if transport == "msgpack" {
+		if tool.Manifest.Runtime.Mode == "persistent" {
+			return e.callPersistentMsgpack(tool, methodName, params)
+		}
+		return e.callOneshotMsgpack(tool, methodName, params)
+	}
+
+	// Default: REPL transport
 	if tool.Manifest.Runtime.Mode == "persistent" {
 		return e.callPersistent(tool, methodName, params)
 	}
@@ -91,7 +103,7 @@ func (e *Executor) callOneshot(tool *Tool, methodName string, params map[string]
 	return e.doCall(repl, methodName, params)
 }
 
-// callPersistent calls a method on a running persistent tool
+// callPersistent calls a method on a running persistent tool (REPL transport)
 func (e *Executor) callPersistent(tool *Tool, methodName string, params map[string]interface{}) (interface{}, error) {
 	e.mu.RLock()
 	repl, ok := e.repls[tool.Name]
@@ -102,6 +114,62 @@ func (e *Executor) callPersistent(tool *Tool, methodName string, params map[stri
 	}
 
 	return e.doCall(repl, methodName, params)
+}
+
+// callOneshotMsgpack runs a tool for a single call using MessagePack transport
+func (e *Executor) callOneshotMsgpack(tool *Tool, methodName string, params map[string]interface{}) (interface{}, error) {
+	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
+
+	// Create module from entrypoint
+	mainModule, err := jumpboot.NewModuleFromPath("__main__", entrypoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load entrypoint: %w", err)
+	}
+
+	// Create program
+	program := &jumpboot.PythonProgram{
+		Name:    tool.Name,
+		Path:    tool.Path,
+		Program: *mainModule,
+	}
+
+	// Create queue process
+	queue, err := tool.Env.NewQueueProcess(program, nil, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create queue process: %w", err)
+	}
+	defer queue.Close()
+
+	// Call the method
+	return e.doQueueCall(queue, methodName, params)
+}
+
+// callPersistentMsgpack calls a method on a running persistent tool (MessagePack transport)
+func (e *Executor) callPersistentMsgpack(tool *Tool, methodName string, params map[string]interface{}) (interface{}, error) {
+	e.mu.RLock()
+	queue, ok := e.queues[tool.Name]
+	e.mu.RUnlock()
+
+	if !ok || queue == nil {
+		return nil, fmt.Errorf("tool %s is not running, start it first", tool.Name)
+	}
+
+	return e.doQueueCall(queue, methodName, params)
+}
+
+// doQueueCall executes a method using MessagePack queue
+func (e *Executor) doQueueCall(queue *jumpboot.QueueProcess, methodName string, params map[string]interface{}) (interface{}, error) {
+	if params == nil {
+		params = make(map[string]interface{})
+	}
+
+	// Call with 5 minute timeout
+	result, err := queue.Call(methodName, 300, params)
+	if err != nil {
+		return nil, fmt.Errorf("queue call failed: %w", err)
+	}
+
+	return result, nil
 }
 
 // initializeService runs the tool's main.py and waits for __JB_READY__
@@ -224,7 +292,11 @@ func (e *Executor) Start(toolName string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Check if already running
 	if _, ok := e.repls[toolName]; ok {
+		return fmt.Errorf("tool %s is already running", toolName)
+	}
+	if _, ok := e.queues[toolName]; ok {
 		return fmt.Errorf("tool %s is already running", toolName)
 	}
 
@@ -233,6 +305,16 @@ func (e *Executor) Start(toolName string) error {
 		return err
 	}
 
+	// Start based on transport
+	transport := tool.Manifest.Runtime.Transport
+	if transport == "msgpack" {
+		return e.startMsgpack(tool)
+	}
+	return e.startRepl(tool)
+}
+
+// startRepl starts a tool with REPL transport
+func (e *Executor) startRepl(tool *Tool) error {
 	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create REPL: %w", err)
@@ -245,7 +327,7 @@ func (e *Executor) Start(toolName string) error {
 		return fmt.Errorf("failed to initialize service: %w", err)
 	}
 
-	e.repls[toolName] = repl
+	e.repls[tool.Name] = repl
 	tool.Status = "running"
 	tool.HealthStatus = "unknown"
 	tool.HealthFailures = 0
@@ -253,11 +335,50 @@ func (e *Executor) Start(toolName string) error {
 	// Start health check if configured
 	if tool.Manifest.Health != nil {
 		ctx, cancel := context.WithCancel(context.Background())
-		e.healthCancels[toolName] = cancel
+		e.healthCancels[tool.Name] = cancel
 		go e.runHealthCheck(ctx, tool)
 	}
 
-	log.Printf("Started %s", toolName)
+	log.Printf("Started %s (REPL)", tool.Name)
+	return nil
+}
+
+// startMsgpack starts a tool with MessagePack transport
+func (e *Executor) startMsgpack(tool *Tool) error {
+	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
+
+	// Create module from entrypoint
+	mainModule, err := jumpboot.NewModuleFromPath("__main__", entrypoint)
+	if err != nil {
+		return fmt.Errorf("failed to load entrypoint: %w", err)
+	}
+
+	// Create program
+	program := &jumpboot.PythonProgram{
+		Name:    tool.Name,
+		Path:    tool.Path,
+		Program: *mainModule,
+	}
+
+	// Create queue process
+	queue, err := tool.Env.NewQueueProcess(program, nil, nil, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create queue process: %w", err)
+	}
+
+	e.queues[tool.Name] = queue
+	tool.Status = "running"
+	tool.HealthStatus = "unknown"
+	tool.HealthFailures = 0
+
+	// Start health check if configured
+	if tool.Manifest.Health != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		e.healthCancels[tool.Name] = cancel
+		go e.runHealthCheckMsgpack(ctx, tool)
+	}
+
+	log.Printf("Started %s (MessagePack)", tool.Name)
 	return nil
 }
 
@@ -271,25 +392,35 @@ func (e *Executor) Stop(toolName string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	repl, ok := e.repls[toolName]
-	if !ok {
-		return fmt.Errorf("tool %s is not running", toolName)
-	}
-
 	// Cancel health check if running
 	if cancel, ok := e.healthCancels[toolName]; ok {
 		cancel()
 		delete(e.healthCancels, toolName)
 	}
 
-	repl.Close()
-	delete(e.repls, toolName)
-	tool.Status = "stopped"
-	tool.HealthStatus = ""
-	tool.HealthFailures = 0
+	// Stop REPL if running
+	if repl, ok := e.repls[toolName]; ok {
+		repl.Close()
+		delete(e.repls, toolName)
+		tool.Status = "stopped"
+		tool.HealthStatus = ""
+		tool.HealthFailures = 0
+		log.Printf("Stopped %s (REPL)", toolName)
+		return nil
+	}
 
-	log.Printf("Stopped %s", toolName)
-	return nil
+	// Stop queue if running
+	if queue, ok := e.queues[toolName]; ok {
+		queue.Close()
+		delete(e.queues, toolName)
+		tool.Status = "stopped"
+		tool.HealthStatus = ""
+		tool.HealthFailures = 0
+		log.Printf("Stopped %s (MessagePack)", toolName)
+		return nil
+	}
+
+	return fmt.Errorf("tool %s is not running", toolName)
 }
 
 // Close stops all running tools
@@ -312,6 +443,16 @@ func (e *Executor) Close() {
 		}
 	}
 	e.repls = make(map[string]*jumpboot.REPLPythonProcess)
+
+	// Close all queues
+	for name, queue := range e.queues {
+		queue.Close()
+		if tool, ok := e.manager.Get(name); ok {
+			tool.Status = "stopped"
+			tool.HealthStatus = ""
+		}
+	}
+	e.queues = make(map[string]*jumpboot.QueueProcess)
 }
 
 // runHealthCheck runs periodic health checks for a tool
@@ -352,7 +493,7 @@ func (e *Executor) runHealthCheck(ctx context.Context, tool *Tool) {
 	}
 }
 
-// doHealthCheck performs a single health check call using __jb_call__
+// doHealthCheck performs a single health check call using __jb_call__ (REPL)
 func (e *Executor) doHealthCheck(tool *Tool, method string) error {
 	e.mu.RLock()
 	repl, ok := e.repls[tool.Name]
@@ -368,6 +509,68 @@ func (e *Executor) doHealthCheck(tool *Tool, method string) error {
 		return fmt.Errorf("health call failed: %w", err)
 	}
 
+	return e.checkHealthResult(result)
+}
+
+// runHealthCheckMsgpack runs periodic health checks for a tool (MessagePack transport)
+func (e *Executor) runHealthCheckMsgpack(ctx context.Context, tool *Tool) {
+	healthCfg := tool.Manifest.Health
+	interval := time.Duration(healthCfg.Interval) * time.Second
+	method := healthCfg.Method
+	threshold := healthCfg.FailureThreshold
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Initial health check after a short delay
+	time.Sleep(2 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := e.doHealthCheckMsgpack(tool, method)
+			if err != nil {
+				tool.HealthFailures++
+				if tool.HealthFailures >= threshold {
+					if tool.HealthStatus != "unhealthy" {
+						tool.HealthStatus = "unhealthy"
+						log.Printf("Health check failed for %s: %v (failures: %d)", tool.Name, err, tool.HealthFailures)
+					}
+				}
+			} else {
+				if tool.HealthStatus != "healthy" {
+					log.Printf("Health check passed for %s", tool.Name)
+				}
+				tool.HealthStatus = "healthy"
+				tool.HealthFailures = 0
+			}
+		}
+	}
+}
+
+// doHealthCheckMsgpack performs a single health check call (MessagePack)
+func (e *Executor) doHealthCheckMsgpack(tool *Tool, method string) error {
+	e.mu.RLock()
+	queue, ok := e.queues[tool.Name]
+	e.mu.RUnlock()
+
+	if !ok || queue == nil {
+		return fmt.Errorf("tool not running")
+	}
+
+	// Call the health method
+	result, err := e.doQueueCall(queue, method, nil)
+	if err != nil {
+		return fmt.Errorf("health call failed: %w", err)
+	}
+
+	return e.checkHealthResult(result)
+}
+
+// checkHealthResult validates the health check response
+func (e *Executor) checkHealthResult(result interface{}) error {
 	// Check for "ok" or "status: ok" in result
 	if resultMap, ok := result.(map[string]interface{}); ok {
 		if status, ok := resultMap["status"].(string); ok && status == "ok" {

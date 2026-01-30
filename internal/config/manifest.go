@@ -19,6 +19,7 @@ type Runtime struct {
 	Packages       []string `yaml:"packages,omitempty"`        // pip packages to install
 	CondaPackages  []string `yaml:"conda_packages,omitempty"`  // conda packages
 	Mode           string   `yaml:"mode"`                      // "persistent" or "oneshot"
+	Transport      string   `yaml:"transport,omitempty"`       // "repl" (default) or "msgpack"
 	Entrypoint     string   `yaml:"entrypoint,omitempty"`      // main script, defaults to main.py
 	StartupTimeout int      `yaml:"startup_timeout,omitempty"` // seconds
 }
@@ -65,6 +66,9 @@ type Health struct {
 func (m *Manifest) ApplyDefaults() {
 	if m.Runtime.Mode == "" {
 		m.Runtime.Mode = "oneshot"
+	}
+	if m.Runtime.Transport == "" {
+		m.Runtime.Transport = "repl" // default, can be "msgpack"
 	}
 	if m.Runtime.Entrypoint == "" {
 		m.Runtime.Entrypoint = "main.py"

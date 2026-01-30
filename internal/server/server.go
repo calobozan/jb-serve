@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/calobozan/jb-serve/internal/config"
@@ -42,6 +44,7 @@ func New(cfg *config.Config, manager *tools.Manager, executor *tools.Executor) *
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/v1/tools", s.handleTools)
 	s.mux.HandleFunc("/v1/tools/", s.handleTool)
+	s.mux.HandleFunc("/v1/files/", s.handleFiles)
 	s.mux.HandleFunc("/health", s.handleHealth)
 }
 
@@ -193,7 +196,10 @@ func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		s.json(w, result)
+		// Wrap file outputs with refs
+		wrappedResult := s.wrapFileOutputs(result, method)
+
+		s.json(w, wrappedResult)
 		return
 	}
 
@@ -203,6 +209,110 @@ func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
 func (s *Server) json(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
+}
+
+// wrapFileOutputs walks through a result and converts file paths to FileRefs
+// It looks for string values that are valid file paths and converts them
+func (s *Server) wrapFileOutputs(result interface{}, method config.Method) interface{} {
+	if s.files == nil {
+		return result
+	}
+
+	// Get output file fields from schema
+	fileFields := getOutputFileFields(method)
+
+	switch v := result.(type) {
+	case map[string]interface{}:
+		wrapped := make(map[string]interface{})
+		for key, val := range v {
+			// Check if this field is marked as type: file in schema
+			if fileFields[key] {
+				if path, ok := val.(string); ok && isFilePath(path) {
+					if ref, err := s.files.RegisterOutput(path); err == nil {
+						wrapped[key] = ref
+						continue
+					}
+				}
+			}
+			// Recursively wrap nested maps
+			wrapped[key] = s.wrapFileOutputs(val, method)
+		}
+		return wrapped
+	case []interface{}:
+		wrapped := make([]interface{}, len(v))
+		for i, item := range v {
+			wrapped[i] = s.wrapFileOutputs(item, method)
+		}
+		return wrapped
+	default:
+		return result
+	}
+}
+
+// isFilePath checks if a string looks like a file path that exists
+func isFilePath(s string) bool {
+	if !strings.HasPrefix(s, "/") {
+		return false
+	}
+	info, err := os.Stat(s)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+// getOutputFileFields returns field names marked as type: file in output schema
+func getOutputFileFields(method config.Method) map[string]bool {
+	fields := make(map[string]bool)
+	if method.Output != nil && method.Output.Properties != nil {
+		for name, prop := range method.Output.Properties {
+			if prop != nil && prop.Type == "file" {
+				fields[name] = true
+			}
+		}
+	}
+	return fields
+}
+
+// handleFiles serves output files
+func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
+	if s.files == nil {
+		http.Error(w, "File serving not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Extract filename from path: /v1/files/abc123.png -> abc123.png
+	filename := strings.TrimPrefix(r.URL.Path, "/v1/files/")
+	if filename == "" {
+		// List files
+		if r.Method == http.MethodGet {
+			s.json(w, s.files.ListOutputs())
+			return
+		}
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Serve file
+	if r.Method == http.MethodGet {
+		filePath := s.files.GetOutputPath(filename)
+		http.ServeFile(w, r, filePath)
+		return
+	}
+
+	// Delete file
+	if r.Method == http.MethodDelete {
+		// Extract ref from filename (remove extension)
+		ref := strings.TrimSuffix(filename, filepath.Ext(filename))
+		if err := s.files.DeleteOutput(ref); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		s.json(w, map[string]string{"status": "deleted"})
+		return
+	}
+
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
 // parseRequestParams extracts parameters from JSON or multipart form data

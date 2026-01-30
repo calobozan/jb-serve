@@ -37,14 +37,9 @@ A tool server that hosts Python tools using [jumpboot](https://github.com/richin
 ## Installation
 
 ```bash
-go install github.com/calobozan/jb-serve/cmd/jb-serve@latest
-```
-
-Or build from source:
-```bash
 git clone https://github.com/calobozan/jb-serve
 cd jb-serve
-go build -o jb-serve ./cmd/jb-serve
+go install ./cmd/jb-serve
 ```
 
 ## Quickstart: Generate an Image
@@ -54,8 +49,12 @@ This walkthrough installs jb-serve, adds an image generation tool, and generates
 ### 1. Install jb-serve
 
 ```bash
-# Install the binary
-go install github.com/calobozan/jb-serve/cmd/jb-serve@latest
+# Clone the repo
+git clone https://github.com/calobozan/jb-serve
+cd jb-serve
+
+# Build and install
+go install ./cmd/jb-serve
 
 # Verify installation
 jb-serve --help

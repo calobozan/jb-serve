@@ -100,6 +100,7 @@ ssh calo@192.168.0.107 "sudo apt-get install -y ffmpeg"
 | `github.com/calobozan/jb-calculator` | Reference oneshot tool (old style) |
 | `~/projects/jb-calculator-new` | Reference tool using jb-service |
 | `~/projects/jb-whisper` | Audio transcription tool (Whisper) |
+| `~/projects/jb-z-image-turbo` | Image generation (Z-Image-Turbo) |
 
 ---
 

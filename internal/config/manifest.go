@@ -10,6 +10,13 @@ type Manifest struct {
 	Resources    Resources    `yaml:"resources,omitempty"`
 	RPC          RPC          `yaml:"rpc"`
 	Health       *Health      `yaml:"health,omitempty"`
+	Setup        *Setup       `yaml:"setup,omitempty"`
+}
+
+// Setup defines post-install setup configuration (e.g., model downloads)
+type Setup struct {
+	Method  string `yaml:"method,omitempty"`  // Method to call, default: "setup"
+	Timeout int    `yaml:"timeout,omitempty"` // Seconds to wait, default: 600 (10 min)
 }
 
 // Runtime defines the Python environment requirements
@@ -88,6 +95,14 @@ func (m *Manifest) ApplyDefaults() {
 		}
 		if m.Health.FailureThreshold == 0 {
 			m.Health.FailureThreshold = 3
+		}
+	}
+	if m.Setup != nil {
+		if m.Setup.Method == "" {
+			m.Setup.Method = "setup"
+		}
+		if m.Setup.Timeout == 0 {
+			m.Setup.Timeout = 600 // 10 minutes default for model downloads
 		}
 	}
 }

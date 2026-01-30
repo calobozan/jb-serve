@@ -143,6 +143,17 @@ func (m *Manager) Install(source string) (*Tool, error) {
 		Env:      env,
 		Status:   "stopped",
 	}
+
+	// Run setup if defined (downloads models, etc.)
+	if manifest.Setup != nil {
+		fmt.Printf("Running setup for %s (this may take a while for model downloads)...\n", manifest.Name)
+		if err := m.runSetup(tool); err != nil {
+			os.RemoveAll(toolPath)
+			return nil, fmt.Errorf("setup failed: %w", err)
+		}
+		fmt.Printf("Setup complete for %s\n", manifest.Name)
+	}
+
 	m.tools[manifest.Name] = tool
 
 	fmt.Printf("Installed %s v%s\n", manifest.Name, manifest.Version)
@@ -197,6 +208,101 @@ func (m *Manager) installPackages(env *jumpboot.PythonEnvironment, manifest *con
 				return err
 			}
 		}
+	}
+
+	return nil
+}
+
+// runSetup runs the tool's setup method to download models, warm caches, etc.
+func (m *Manager) runSetup(tool *Tool) error {
+	setupCfg := tool.Manifest.Setup
+	method := setupCfg.Method
+	timeout := setupCfg.Timeout
+
+	// Use msgpack transport if specified, otherwise REPL
+	transport := tool.Manifest.Runtime.Transport
+	if transport == "msgpack" {
+		return m.runSetupMsgpack(tool, method, timeout)
+	}
+	return m.runSetupRepl(tool, method, timeout)
+}
+
+// runSetupRepl runs setup using REPL transport
+func (m *Manager) runSetupRepl(tool *Tool, method string, timeout int) error {
+	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
+
+	// Create a REPL process
+	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, nil, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create REPL: %w", err)
+	}
+	defer repl.Close()
+
+	// Initialize the service
+	initCode := fmt.Sprintf(`
+__name__ = "__main__"
+exec(open(%q).read())
+`, entrypoint)
+
+	_, err = repl.Execute(initCode, true)
+	if err != nil {
+		return fmt.Errorf("failed to run entrypoint: %w", err)
+	}
+
+	// Import jb functions
+	importCode := `
+import builtins
+if hasattr(builtins, '__jb_call__'):
+    __jb_call__ = builtins.__jb_call__
+`
+	_, err = repl.Execute(importCode, true)
+	if err != nil {
+		return fmt.Errorf("failed to import jb functions: %w", err)
+	}
+
+	// Call the setup method
+	callCode := fmt.Sprintf(`__jb_call__(%q, {})`, method)
+	result, err := repl.Execute(callCode, true)
+	if err != nil {
+		return fmt.Errorf("setup call failed: %w", err)
+	}
+
+	// Check for errors in response
+	if strings.Contains(result, `"ok": false`) || strings.Contains(result, `"ok":false`) {
+		return fmt.Errorf("setup returned error: %s", result)
+	}
+
+	return nil
+}
+
+// runSetupMsgpack runs setup using MessagePack transport
+func (m *Manager) runSetupMsgpack(tool *Tool, method string, timeout int) error {
+	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
+
+	// Create module from entrypoint
+	mainModule, err := jumpboot.NewModuleFromPath("__main__", entrypoint)
+	if err != nil {
+		return fmt.Errorf("failed to load entrypoint: %w", err)
+	}
+
+	// Create program
+	program := &jumpboot.PythonProgram{
+		Name:    tool.Name,
+		Path:    tool.Path,
+		Program: *mainModule,
+	}
+
+	// Create queue process
+	queue, err := tool.Env.NewQueueProcess(program, nil, nil, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create queue process: %w", err)
+	}
+	defer queue.Close()
+
+	// Call the setup method with extended timeout
+	_, err = queue.Call(method, timeout, map[string]interface{}{})
+	if err != nil {
+		return fmt.Errorf("setup call failed: %w", err)
 	}
 
 	return nil

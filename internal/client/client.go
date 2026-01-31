@@ -195,3 +195,92 @@ func (c *Client) Call(toolName, methodName string, params map[string]interface{}
 	}
 	return result, nil
 }
+
+// FilesList returns all files in the store.
+func (c *Client) FilesList() ([]map[string]interface{}, error) {
+	resp, err := c.HTTPClient.Get(c.BaseURL + "/v1/store")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list files: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("server error: %s", string(body))
+	}
+
+	var result struct {
+		Files []map[string]interface{} `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return result.Files, nil
+}
+
+// FilesImport imports a file into the store.
+func (c *Client) FilesImport(path, name string, ttl int64) (map[string]interface{}, error) {
+	data := map[string]interface{}{
+		"path": path,
+		"ttl":  ttl,
+	}
+	if name != "" {
+		data["name"] = name
+	}
+
+	body, _ := json.Marshal(data)
+	resp, err := c.HTTPClient.Post(c.BaseURL+"/v1/store", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to import file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if errMsg, ok := result["error"].(string); ok {
+		return nil, fmt.Errorf("import failed: %s", errMsg)
+	}
+	return result, nil
+}
+
+// FilesInfo returns info for a file.
+func (c *Client) FilesInfo(id string) (map[string]interface{}, error) {
+	resp, err := c.HTTPClient.Get(c.BaseURL + "/v1/store/" + id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get file info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if errMsg, ok := result["error"].(string); ok {
+		return nil, fmt.Errorf("file not found: %s", errMsg)
+	}
+	return result, nil
+}
+
+// FilesDelete deletes a file from the store.
+func (c *Client) FilesDelete(id string) error {
+	req, _ := http.NewRequest(http.MethodDelete, c.BaseURL+"/v1/store/"+id, nil)
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if errMsg, ok := result["error"].(string); ok {
+		return fmt.Errorf("delete failed: %s", errMsg)
+	}
+	return nil
+}

@@ -323,17 +323,113 @@ var stopCmd = &cobra.Command{
 	},
 }
 
+// files - file store management
+var filesCmd = &cobra.Command{
+	Use:   "files",
+	Short: "Manage file store",
+}
+
+var filesListCmd = &cobra.Command{
+	Use:   "ls",
+	Short: "List files in store",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		files, err := apiClient.FilesList()
+		if err != nil {
+			return err
+		}
+
+		if len(files) == 0 {
+			fmt.Println("No files in store.")
+			return nil
+		}
+
+		fmt.Printf("%-36s  %-10s  %-20s  %s\n", "ID", "SIZE", "CREATED", "NAME")
+		for _, f := range files {
+			fmt.Printf("%-36s  %-10d  %-20d  %s\n",
+				f["id"], int64(f["size"].(float64)), int64(f["created_at"].(float64)), f["name"])
+		}
+		return nil
+	},
+}
+
+var filesImportName string
+var filesImportTTL int64
+var filesImportCmd = &cobra.Command{
+	Use:   "import <path>",
+	Short: "Import a file into store",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		info, err := apiClient.FilesImport(args[0], filesImportName, filesImportTTL)
+		if err != nil {
+			return err
+		}
+		out, _ := json.MarshalIndent(info, "", "  ")
+		fmt.Println(string(out))
+		return nil
+	},
+}
+
+var filesInfoCmd = &cobra.Command{
+	Use:   "info <id>",
+	Short: "Get file info",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		info, err := apiClient.FilesInfo(args[0])
+		if err != nil {
+			return err
+		}
+		out, _ := json.MarshalIndent(info, "", "  ")
+		fmt.Println(string(out))
+		return nil
+	},
+}
+
+var filesDeleteCmd = &cobra.Command{
+	Use:   "rm <id>",
+	Short: "Delete a file",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := apiClient.FilesDelete(args[0]); err != nil {
+			return err
+		}
+		fmt.Println("Deleted")
+		return nil
+	},
+}
+
+func init() {
+	filesImportCmd.Flags().StringVar(&filesImportName, "name", "", "Display name for file")
+	filesImportCmd.Flags().Int64Var(&filesImportTTL, "ttl", 0, "TTL in seconds (0 = permanent)")
+
+	filesCmd.AddCommand(filesListCmd)
+	filesCmd.AddCommand(filesImportCmd)
+	filesCmd.AddCommand(filesInfoCmd)
+	filesCmd.AddCommand(filesDeleteCmd)
+	rootCmd.AddCommand(filesCmd)
+}
+
 // serve - standalone, starts the server
-var servePort int
+var (
+	servePort         int
+	serveStorePath    string
+	serveStoreDisable bool
+)
+
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the HTTP API server",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		srv := server.New(cfg, manager, executor)
+		opts := server.Options{
+			FileStorePath:    serveStorePath,
+			FileStoreDisable: serveStoreDisable,
+		}
+		srv := server.NewWithOptions(cfg, manager, executor, opts)
 		return srv.ListenAndServe(servePort)
 	},
 }
 
 func init() {
 	serveCmd.Flags().IntVar(&servePort, "port", 9800, "Port to listen on")
+	serveCmd.Flags().StringVar(&serveStorePath, "store-path", "", "File store directory (default: ~/.jb-serve)")
+	serveCmd.Flags().BoolVar(&serveStoreDisable, "no-store", false, "Disable file store")
 }

@@ -6,6 +6,32 @@ A generic server that hosts multiple Python tools, each with its own isolated en
 
 ---
 
+## Build Requirements
+
+**CGO is required.** jb-serve uses:
+- `github.com/mattn/go-sqlite3` for file store metadata (requires CGO)
+- Future: semaphores and shared memory for IPC
+
+This means **cross-compilation doesn't work** — you must build on the target platform or use a CGO-enabled cross-compiler.
+
+### Local Development (macOS)
+```bash
+cd ~/projects/jb-serve
+go build -o jb-serve ./cmd/jb-serve
+```
+
+### Production Build (Linux)
+Build directly on the target server:
+```bash
+# Sync source to server
+rsync -av --exclude '.git' ~/projects/jb-serve/ calo@192.168.0.107:~/projects/jb-serve/
+
+# Build on server
+ssh calo@192.168.0.107 "cd ~/projects/jb-serve && go build -o ~/bin/jb-serve ./cmd/jb-serve"
+```
+
+---
+
 ## Development Workflow
 
 **Target: GPU Server** — jb-serve runs on `192.168.0.107` (gpu-server) as a systemd service.
@@ -18,16 +44,12 @@ A generic server that hosts multiple Python tools, each with its own isolated en
 
 ### Deploy jb-serve Changes
 ```bash
-# Build for Linux (GPU server is x86_64 Linux)
-cd ~/projects/jb-serve
-GOOS=linux GOARCH=amd64 go build -o jb-serve-linux ./cmd/jb-serve
-
-# Deploy to GPU server
-scp jb-serve-linux calo@192.168.0.107:/home/calo/bin/jb-serve
+# Sync source and build on server (CGO required - can't cross-compile)
+rsync -av --exclude '.git' ~/projects/jb-serve/ calo@192.168.0.107:~/projects/jb-serve/
+ssh calo@192.168.0.107 "cd ~/projects/jb-serve && go build -o ~/bin/jb-serve ./cmd/jb-serve"
 
 # Restart service
-ssh calo@192.168.0.107 "sudo systemctl restart jb-serve"
-# Or if sudo hangs: ssh calo@192.168.0.107 "pkill jb-serve; nohup ~/bin/jb-serve serve --port 9800 &"
+ssh calo@192.168.0.107 "pkill jb-serve; sleep 1; nohup ~/bin/jb-serve serve --port 9800 > /tmp/jb-serve.log 2>&1 &"
 ```
 
 ### Deploy a New Tool
@@ -279,7 +301,206 @@ class MediaProcessor(Service):
 
 ---
 
-## File Handling
+## File Store
+
+The file store provides persistent, shared file storage for all tools. Files are stored as blobs with UUID names and metadata in SQLite.
+
+### Features
+- **UUID-based storage**: Files get a unique ID, original name preserved in metadata
+- **TTL support**: Files can expire automatically (0 = permanent)
+- **Garbage collection**: Expired files cleaned up every 5 minutes
+- **SHA256 checksums**: Integrity verification
+- **Cross-tool sharing**: Any tool can read files imported by another
+- **Direct filesystem access**: Python tools read blobs directly (no HTTP overhead)
+
+### Server Configuration
+
+```bash
+# Start with default file store (~/.jb-serve)
+jb-serve serve --port 9800
+
+# Custom file store location
+jb-serve serve --port 9800 --store-path /data/jb-files
+
+# Disable file store entirely
+jb-serve serve --port 9800 --no-store
+```
+
+### Storage Layout
+
+```
+~/.jb-serve/
+├── files.db          # SQLite metadata (name, size, sha256, timestamps)
+├── blobs/            # Flat directory of UUID-named files
+│   ├── 2737077c-5fb3-42cf-860c-2a5a141a2cae
+│   ├── 5ffd33dc-1bc1-4d3b-897c-a5337ccce756
+│   └── ...
+└── ...
+```
+
+### Integrating File Store in Python Tools
+
+Every `Service` and `MessagePackService` subclass has `self.files` automatically available — a `FileStore` client connected to jb-serve.
+
+#### Basic Pattern: Import Generated Files
+
+```python
+import os
+from jb_service import MessagePackService, method, run, save_image
+
+class ImageGenerator(MessagePackService):
+    name = "image-gen"
+    
+    @method
+    def generate(self, prompt: str, ttl: int = 3600) -> dict:
+        # 1. Generate output to temp file
+        image = self.pipeline(prompt)
+        temp_path = save_image(image, format="png")
+        
+        # 2. Import into file store
+        file_id = self.files.import_file(
+            temp_path,
+            name=f"generated-{prompt[:20]}.png",
+            ttl=ttl  # seconds until auto-delete (0 = permanent)
+        )
+        
+        # 3. Clean up temp file (optional - the store has its own copy)
+        os.remove(temp_path)
+        
+        # 4. Return file_id for retrieval
+        return {"file_id": file_id}
+```
+
+#### Reading Files from Store
+
+```python
+@method
+def process_stored_file(self, file_id: str) -> dict:
+    # Get direct filesystem path (efficient, no HTTP)
+    path = self.files.get_path(file_id)
+    
+    with open(path, 'rb') as f:
+        data = f.read()
+    
+    return {"size": len(data)}
+```
+
+#### File Metadata
+
+```python
+@method
+def get_file_info(self, file_id: str) -> dict:
+    info = self.files.info(file_id)
+    return {
+        "id": info.id,
+        "name": info.name,
+        "size": info.size,
+        "sha256": info.sha256,
+        "path": info.path,
+        "created_at": info.created_at,
+        "expires_at": info.expires_at,  # 0 = permanent
+    }
+```
+
+#### Listing and Managing Files
+
+```python
+@method
+def list_my_files(self) -> dict:
+    files = self.files.list()
+    return {"files": [{"id": f.id, "name": f.name} for f in files]}
+
+@method
+def rename_file(self, file_id: str, new_name: str) -> dict:
+    info = self.files.rename(file_id, new_name)
+    return {"name": info.name}
+
+@method
+def extend_ttl(self, file_id: str, ttl: int) -> dict:
+    info = self.files.set_ttl(file_id, ttl)
+    return {"expires_at": info.expires_at}
+
+@method
+def delete_file(self, file_id: str) -> dict:
+    self.files.delete(file_id)
+    return {"deleted": file_id}
+```
+
+#### Cross-Tool File Sharing
+
+Tool A generates a file:
+```python
+# In tool A
+file_id = self.files.import_file("/tmp/output.wav", name="audio.wav", ttl=7200)
+return {"file_id": file_id}
+```
+
+Tool B processes it:
+```python
+# In tool B
+@method
+def process(self, file_id: str) -> dict:
+    path = self.files.get_path(file_id)  # Direct access to same blob
+    # ... process file ...
+```
+
+### HTTP API
+
+```bash
+# List files
+curl http://localhost:9800/v1/store
+# Response: {"files": [{"id": "...", "name": "...", "size": 123, ...}]}
+
+# Import file (server-side path)
+curl -X POST http://localhost:9800/v1/store \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/path/to/file.png", "name": "myfile.png", "ttl": 3600}'
+
+# Import file (multipart upload)
+curl -X POST http://localhost:9800/v1/store \
+  -F "file=@local.png" -F "name=uploaded.png" -F "ttl=3600"
+
+# Get file info
+curl http://localhost:9800/v1/store/{id}
+
+# Download file content
+curl http://localhost:9800/v1/store/{id}/content -o file.png
+
+# Rename or update TTL
+curl -X PATCH http://localhost:9800/v1/store/{id} \
+  -H "Content-Type: application/json" \
+  -d '{"name": "newname.png", "ttl": 7200}'
+
+# Delete file
+curl -X DELETE http://localhost:9800/v1/store/{id}
+```
+
+### CLI
+
+```bash
+# List files
+jb-serve files ls
+
+# Import a file
+jb-serve files import /path/to/file.png --name "myfile.png" --ttl 3600
+
+# Get info
+jb-serve files info <uuid>
+
+# Delete
+jb-serve files rm <uuid>
+```
+
+### TTL and Garbage Collection
+
+- **TTL = 0**: File is permanent (never auto-deleted)
+- **TTL > 0**: File expires after TTL seconds from import time
+- **GC runs every 5 minutes**: Scans for expired files and removes them
+- **Clients can extend TTL**: Use `set_ttl()` or `PATCH` to update expiration
+
+---
+
+## File Handling (Legacy)
 
 ### Output Files (FileRef)
 When tools return file paths, jb-serve wraps them as FileRef objects:
@@ -312,7 +533,7 @@ Two options:
 
 ```
 ~/projects/jb-serve/
-├── cmd/jb-serve/main.go
+├── cmd/jb-serve/main.go         # CLI with files subcommand
 ├── internal/
 │   ├── config/
 │   │   ├── config.go
@@ -321,9 +542,13 @@ Two options:
 │   │   ├── manager.go
 │   │   └── executor.go          # REPL + MessagePack transports
 │   ├── files/
-│   │   └── files.go             # FileRef handling
+│   │   └── files.go             # FileRef handling (legacy)
+│   ├── filestore/
+│   │   └── filestore.go         # Persistent file store with SQLite
+│   ├── client/
+│   │   └── client.go            # HTTP client (includes Files* methods)
 │   └── server/
-│       └── server.go            # /v1/files endpoint
+│       └── server.go            # /v1/store endpoints
 ├── docs/
 │   ├── PYTHON-SDK.md
 │   └── BINARY-HANDLING.md
@@ -332,11 +557,12 @@ Two options:
 ~/projects/jb-service/
 ├── src/jb_service/
 │   ├── __init__.py
-│   ├── service.py               # Service base class (REPL)
+│   ├── service.py               # Service base class (includes self.files)
 │   ├── msgpack_service.py       # MessagePackService base class
 │   ├── msgpack_protocol.py      # MessagePack transport protocol
 │   ├── method.py                # @method decorator
 │   ├── protocol.py              # run(), auto-transport detection
+│   ├── filestore.py             # FileStore client for Python
 │   └── types.py                 # FilePath, Audio, Image, save_image()
 └── tests/
 ```
@@ -380,6 +606,15 @@ curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
 - [x] **Phase 3**: MessagePack transport for stdout-safe tools
 - [x] **z-image-turbo**: Image generation with progress bars working
 - [x] **FileRef system**: Output files served via `/v1/files/{ref}`
+
+### Phase 4 ✅ — File Store
+- **Persistent file storage** with SQLite metadata
+- UUID-based blob storage in flat directory
+- TTL support with garbage collection
+- SHA256 checksums for integrity
+- HTTP API: `/v1/store` for import, list, info, delete
+- Python `FileStore` client in jb-service base class
+- CLI commands: `jb-serve files ls/import/info/rm`
 
 ### Remaining Candidates
 - [ ] Convert jb-whisper to MessagePack (if needed)

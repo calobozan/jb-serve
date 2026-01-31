@@ -7,35 +7,67 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/calobozan/jb-serve/internal/config"
 	"github.com/calobozan/jb-serve/internal/files"
+	"github.com/calobozan/jb-serve/internal/filestore"
 	"github.com/calobozan/jb-serve/internal/tools"
 )
 
 // Server is the jb-serve HTTP API server
 type Server struct {
-	cfg      *config.Config
-	manager  *tools.Manager
-	executor *tools.Executor
-	files    *files.Manager
-	mux      *http.ServeMux
+	cfg       *config.Config
+	manager   *tools.Manager
+	executor  *tools.Executor
+	files     *files.Manager
+	filestore *filestore.Store
+	mux       *http.ServeMux
 }
 
-// New creates a new API server
+// Options configures the server
+type Options struct {
+	FileStorePath    string // Custom path for file store (empty = use base dir)
+	FileStoreDisable bool   // Disable file store entirely
+}
+
+// New creates a new API server with default options
 func New(cfg *config.Config, manager *tools.Manager, executor *tools.Executor) *Server {
+	return NewWithOptions(cfg, manager, executor, Options{})
+}
+
+// NewWithOptions creates a new API server with custom options
+func NewWithOptions(cfg *config.Config, manager *tools.Manager, executor *tools.Executor, opts Options) *Server {
 	fileMgr, err := files.NewManager(cfg.BaseDir())
 	if err != nil {
 		log.Printf("Warning: failed to create file manager: %v", err)
 	}
 
+	// Create persistent file store (unless disabled)
+	var store *filestore.Store
+	if !opts.FileStoreDisable {
+		storePath := opts.FileStorePath
+		if storePath == "" {
+			storePath = cfg.BaseDir()
+		}
+		store, err = filestore.New(storePath)
+		if err != nil {
+			log.Printf("Warning: failed to create filestore at %s: %v", storePath, err)
+		} else {
+			log.Printf("File store initialized at %s", storePath)
+		}
+	} else {
+		log.Printf("File store disabled")
+	}
+
 	s := &Server{
-		cfg:      cfg,
-		manager:  manager,
-		executor: executor,
-		files:    fileMgr,
-		mux:      http.NewServeMux(),
+		cfg:       cfg,
+		manager:   manager,
+		executor:  executor,
+		files:     fileMgr,
+		filestore: store,
+		mux:       http.NewServeMux(),
 	}
 	s.setupRoutes()
 	return s
@@ -45,6 +77,8 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/v1/tools", s.handleTools)
 	s.mux.HandleFunc("/v1/tools/", s.handleTool)
 	s.mux.HandleFunc("/v1/files/", s.handleFiles)
+	s.mux.HandleFunc("/v1/store", s.handleStore)
+	s.mux.HandleFunc("/v1/store/", s.handleStoreItem)
 	s.mux.HandleFunc("/health", s.handleHealth)
 }
 
@@ -53,6 +87,19 @@ func (s *Server) ListenAndServe(port int) error {
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("jb-serve API listening on %s", addr)
 	return http.ListenAndServe(addr, s.authMiddleware(s.mux))
+}
+
+// Close cleans up server resources
+func (s *Server) Close() error {
+	if s.filestore != nil {
+		return s.filestore.Close()
+	}
+	return nil
+}
+
+// FileStore returns the server's file store for external access
+func (s *Server) FileStore() *filestore.Store {
+	return s.filestore
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
@@ -313,6 +360,191 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+// handleStore handles /v1/store (list, import, stats)
+func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
+	if s.filestore == nil {
+		http.Error(w, "File store not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		// GET /v1/store - list files
+		includeExpired := r.URL.Query().Get("include_expired") == "true"
+		files, err := s.filestore.List(includeExpired)
+		if err != nil {
+			s.jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.json(w, map[string]interface{}{
+			"files": files,
+		})
+
+	case http.MethodPost:
+		// POST /v1/store - import a file
+		// Accepts multipart form with file upload, or JSON with path
+		contentType := r.Header.Get("Content-Type")
+
+		var sourcePath string
+		var name string
+		var ttl int64
+
+		if strings.HasPrefix(contentType, "multipart/form-data") {
+			// File upload
+			if err := r.ParseMultipartForm(256 << 20); err != nil { // 256MB max
+				s.jsonError(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			file, header, err := r.FormFile("file")
+			if err != nil {
+				s.jsonError(w, "No file provided", http.StatusBadRequest)
+				return
+			}
+			defer file.Close()
+
+			// Save to temp location first
+			tempPath, err := s.files.SaveUpload(file, header)
+			if err != nil {
+				s.jsonError(w, "Failed to save upload: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer os.Remove(tempPath)
+
+			sourcePath = tempPath
+			name = r.FormValue("name")
+			if name == "" {
+				name = header.Filename
+			}
+			if ttlStr := r.FormValue("ttl"); ttlStr != "" {
+				ttl, _ = strconv.ParseInt(ttlStr, 10, 64)
+			}
+		} else {
+			// JSON with path
+			var req struct {
+				Path string `json:"path"`
+				Name string `json:"name"`
+				TTL  int64  `json:"ttl"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.jsonError(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.Path == "" {
+				s.jsonError(w, "path is required", http.StatusBadRequest)
+				return
+			}
+			sourcePath = req.Path
+			name = req.Name
+			ttl = req.TTL
+		}
+
+		info, err := s.filestore.Import(sourcePath, name, ttl)
+		if err != nil {
+			s.jsonError(w, "Import failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		s.json(w, info)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleStoreItem handles /v1/store/{id} (get, info, rename, delete, content)
+func (s *Server) handleStoreItem(w http.ResponseWriter, r *http.Request) {
+	if s.filestore == nil {
+		http.Error(w, "File store not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Extract ID from path: /v1/store/{id} or /v1/store/{id}/content
+	path := strings.TrimPrefix(r.URL.Path, "/v1/store/")
+	parts := strings.SplitN(path, "/", 2)
+	id := parts[0]
+
+	if id == "" {
+		http.Error(w, "ID required", http.StatusBadRequest)
+		return
+	}
+
+	// Check for /content suffix
+	isContent := len(parts) > 1 && parts[1] == "content"
+
+	switch r.Method {
+	case http.MethodGet:
+		if isContent {
+			// GET /v1/store/{id}/content - download file
+			blobPath, err := s.filestore.GetPath(id)
+			if err != nil {
+				s.jsonError(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.ServeFile(w, r, blobPath)
+			return
+		}
+
+		// GET /v1/store/{id} - get info
+		info, err := s.filestore.Info(id)
+		if err != nil {
+			s.jsonError(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		s.json(w, info)
+
+	case http.MethodPatch:
+		// PATCH /v1/store/{id} - rename or set TTL
+		var req struct {
+			Name string `json:"name,omitempty"`
+			TTL  *int64 `json:"ttl,omitempty"` // pointer to distinguish 0 from unset
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.jsonError(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if req.Name != "" {
+			if err := s.filestore.Rename(id, req.Name); err != nil {
+				s.jsonError(w, err.Error(), http.StatusNotFound)
+				return
+			}
+		}
+
+		if req.TTL != nil {
+			if err := s.filestore.SetTTL(id, *req.TTL); err != nil {
+				s.jsonError(w, err.Error(), http.StatusNotFound)
+				return
+			}
+		}
+
+		// Return updated info
+		info, err := s.filestore.Info(id)
+		if err != nil {
+			s.jsonError(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		s.json(w, info)
+
+	case http.MethodDelete:
+		// DELETE /v1/store/{id} - delete file
+		if err := s.filestore.Delete(id); err != nil {
+			s.jsonError(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		s.json(w, map[string]string{"status": "deleted", "id": id})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) jsonError(w http.ResponseWriter, message string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
 // parseRequestParams extracts parameters from JSON or multipart form data

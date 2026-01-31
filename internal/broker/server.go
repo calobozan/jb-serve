@@ -29,6 +29,7 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/v1/broker/register", s.handleRegister)
 	s.mux.HandleFunc("/v1/broker/heartbeat", s.handleHeartbeat)
 	s.mux.HandleFunc("/v1/broker/children", s.handleChildren)
+	s.mux.HandleFunc("/v1/broker/describe", s.handleDescribe)
 
 	// Aggregated endpoints
 	s.mux.HandleFunc("/v1/tools", s.handleTools)
@@ -71,6 +72,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDescribe returns agent-friendly descriptions of all servers
+func (s *Server) handleDescribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	descriptions := s.broker.DescribeServers()
+	s.json(w, map[string]interface{}{
+		"servers": descriptions,
+	})
+}
+
 // handleRegister handles child server registration
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -79,10 +93,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ID    string   `json:"id"`
-		URL   string   `json:"url"`
-		Name  string   `json:"name"`
-		Tools []string `json:"tools"`
+		ID       string   `json:"id"`
+		URL      string   `json:"url"`
+		Name     string   `json:"name"`
+		Tools    []string `json:"tools"`
+		AgentDoc string   `json:"agent_doc"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -96,10 +111,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	child := &ChildServer{
-		ID:    req.ID,
-		URL:   req.URL,
-		Name:  req.Name,
-		Tools: req.Tools,
+		ID:       req.ID,
+		URL:      req.URL,
+		Name:     req.Name,
+		Tools:    req.Tools,
+		AgentDoc: req.AgentDoc,
 	}
 
 	if child.Name == "" {
@@ -112,8 +128,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.json(w, map[string]interface{}{
-		"status":     "registered",
-		"id":         child.ID,
+		"status":             "registered",
+		"id":                 child.ID,
 		"heartbeat_interval": int(s.broker.heartbeatTimeout.Seconds() / 2),
 	})
 }

@@ -20,6 +20,7 @@ type ChildClient struct {
 	id        string
 	name      string
 	tools     []string
+	agentDoc  string
 
 	client   *http.Client
 	interval time.Duration
@@ -55,17 +56,26 @@ func (c *ChildClient) SetTools(tools []string) {
 	c.mu.Unlock()
 }
 
+// SetAgentDoc sets the agent documentation for this server
+func (c *ChildClient) SetAgentDoc(doc string) {
+	c.mu.Lock()
+	c.agentDoc = doc
+	c.mu.Unlock()
+}
+
 // Register connects to the broker and starts heartbeat
 func (c *ChildClient) Register() error {
 	c.mu.RLock()
 	tools := c.tools
+	agentDoc := c.agentDoc
 	c.mu.RUnlock()
 
 	req := map[string]interface{}{
-		"id":    c.id,
-		"url":   c.selfURL,
-		"name":  c.name,
-		"tools": tools,
+		"id":        c.id,
+		"url":       c.selfURL,
+		"name":      c.name,
+		"tools":     tools,
+		"agent_doc": agentDoc,
 	}
 
 	body, _ := json.Marshal(req)

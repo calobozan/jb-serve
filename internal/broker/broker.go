@@ -17,13 +17,14 @@ import (
 
 // ChildServer represents a connected jb-serve instance
 type ChildServer struct {
-	ID           string    `json:"id"`
-	URL          string    `json:"url"`           // Base URL (e.g., "http://192.168.0.107:9801")
-	Name         string    `json:"name"`          // Human-readable name
-	Tools        []string  `json:"tools"`         // List of tool names available
-	RegisteredAt time.Time `json:"registered_at"`
+	ID            string    `json:"id"`
+	URL           string    `json:"url"`            // Base URL (e.g., "http://192.168.0.107:9801")
+	Name          string    `json:"name"`           // Human-readable name
+	Tools         []string  `json:"tools"`          // List of tool names available
+	AgentDoc      string    `json:"agent_doc,omitempty"` // Markdown describing server purpose
+	RegisteredAt  time.Time `json:"registered_at"`
 	LastHeartbeat time.Time `json:"last_heartbeat"`
-	Status       string    `json:"status"`        // "healthy", "unhealthy", "dead"
+	Status        string    `json:"status"`         // "healthy", "unhealthy", "dead"
 }
 
 // ToolInfo represents aggregated tool information from a child
@@ -173,6 +174,35 @@ func (b *Broker) ListChildren() []*ChildServer {
 		children = append(children, child)
 	}
 	return children
+}
+
+// ServerDescription is a summary for agent consumption
+type ServerDescription struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	URL      string   `json:"url"`
+	Status   string   `json:"status"`
+	Tools    []string `json:"tools"`
+	AgentDoc string   `json:"agent_doc,omitempty"`
+}
+
+// DescribeServers returns agent-friendly descriptions of all servers
+func (b *Broker) DescribeServers() []ServerDescription {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	descriptions := make([]ServerDescription, 0, len(b.children))
+	for _, child := range b.children {
+		descriptions = append(descriptions, ServerDescription{
+			ID:       child.ID,
+			Name:     child.Name,
+			URL:      child.URL,
+			Status:   child.Status,
+			Tools:    child.Tools,
+			AgentDoc: child.AgentDoc,
+		})
+	}
+	return descriptions
 }
 
 // ListTools aggregates tools from all healthy children

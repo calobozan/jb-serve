@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/calobozan/jb-serve/internal/broker"
@@ -426,6 +427,7 @@ var (
 	serveBrokerURL    string
 	serveSelfURL      string
 	serveNodeName     string
+	serveAgentDoc     string
 )
 
 var serveCmd = &cobra.Command{
@@ -455,6 +457,21 @@ var serveCmd = &cobra.Command{
 			}
 			childClient.SetTools(toolNames)
 
+			// Load agent doc if specified
+			if serveAgentDoc != "" {
+				docBytes, err := os.ReadFile(serveAgentDoc)
+				if err != nil {
+					return fmt.Errorf("failed to read agent doc %s: %w", serveAgentDoc, err)
+				}
+				childClient.SetAgentDoc(string(docBytes))
+			} else {
+				// Try default location
+				defaultDoc := filepath.Join(cfg.BaseDir(), "AGENT.md")
+				if docBytes, err := os.ReadFile(defaultDoc); err == nil {
+					childClient.SetAgentDoc(string(docBytes))
+				}
+			}
+
 			if err := childClient.Register(); err != nil {
 				return fmt.Errorf("failed to register with broker: %w", err)
 			}
@@ -472,6 +489,7 @@ func init() {
 	serveCmd.Flags().StringVar(&serveBrokerURL, "broker", "", "Broker URL to register with (e.g., http://192.168.0.100:9800)")
 	serveCmd.Flags().StringVar(&serveSelfURL, "self-url", "", "This server's URL for broker callbacks (default: http://localhost:PORT)")
 	serveCmd.Flags().StringVar(&serveNodeName, "name", "", "Node name for broker registration (default: hostname)")
+	serveCmd.Flags().StringVar(&serveAgentDoc, "agent-doc", "", "Path to agent documentation file (default: ~/.jb-serve/AGENT.md)")
 }
 
 // broker - standalone, starts the broker server

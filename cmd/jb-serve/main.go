@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/calobozan/jb-serve/internal/broker"
 	"github.com/calobozan/jb-serve/internal/client"
 	"github.com/calobozan/jb-serve/internal/config"
 	"github.com/calobozan/jb-serve/internal/server"
@@ -417,6 +418,9 @@ var (
 	servePort         int
 	serveStorePath    string
 	serveStoreDisable bool
+	serveBrokerURL    string
+	serveSelfURL      string
+	serveNodeName     string
 )
 
 var serveCmd = &cobra.Command{
@@ -428,6 +432,30 @@ var serveCmd = &cobra.Command{
 			FileStoreDisable: serveStoreDisable,
 		}
 		srv := server.NewWithOptions(cfg, manager, executor, opts)
+
+		// If broker URL specified, register with broker
+		if serveBrokerURL != "" {
+			selfURL := serveSelfURL
+			if selfURL == "" {
+				selfURL = fmt.Sprintf("http://localhost:%d", servePort)
+			}
+
+			childClient := broker.NewChildClient(serveBrokerURL, selfURL, serveNodeName)
+
+			// Get tool names
+			toolList := manager.List()
+			toolNames := make([]string, len(toolList))
+			for i, t := range toolList {
+				toolNames[i] = t.Name
+			}
+			childClient.SetTools(toolNames)
+
+			if err := childClient.Register(); err != nil {
+				return fmt.Errorf("failed to register with broker: %w", err)
+			}
+			defer childClient.Stop()
+		}
+
 		return srv.ListenAndServe(servePort)
 	},
 }
@@ -436,4 +464,41 @@ func init() {
 	serveCmd.Flags().IntVar(&servePort, "port", 9800, "Port to listen on")
 	serveCmd.Flags().StringVar(&serveStorePath, "store-path", "", "File store directory (default: ~/.jb-serve)")
 	serveCmd.Flags().BoolVar(&serveStoreDisable, "no-store", false, "Disable file store")
+	serveCmd.Flags().StringVar(&serveBrokerURL, "broker", "", "Broker URL to register with (e.g., http://192.168.0.100:9800)")
+	serveCmd.Flags().StringVar(&serveSelfURL, "self-url", "", "This server's URL for broker callbacks (default: http://localhost:PORT)")
+	serveCmd.Flags().StringVar(&serveNodeName, "name", "", "Node name for broker registration (default: hostname)")
+}
+
+// broker - standalone, starts the broker server
+var brokerPort int
+
+var brokerCmd = &cobra.Command{
+	Use:   "broker",
+	Short: "Start the broker server (aggregates multiple jb-serve instances)",
+	Long: `Start jb-serve in broker mode. The broker aggregates tools from multiple
+child jb-serve instances and routes requests to the appropriate backend.
+
+Child servers register with the broker using:
+  jb-serve serve --broker http://BROKER:PORT --self-url http://THIS_SERVER:PORT
+
+Example:
+  # On the broker machine:
+  jb-serve broker --port 9800
+
+  # On GPU server 1:
+  jb-serve serve --port 9801 --broker http://broker:9800 --self-url http://gpu1:9801
+
+  # On GPU server 2:
+  jb-serve serve --port 9801 --broker http://broker:9800 --self-url http://gpu2:9801
+`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		srv := broker.NewServer()
+		defer srv.Close()
+		return srv.ListenAndServe(brokerPort)
+	},
+}
+
+func init() {
+	brokerCmd.Flags().IntVar(&brokerPort, "port", 9800, "Port to listen on")
+	rootCmd.AddCommand(brokerCmd)
 }

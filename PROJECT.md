@@ -269,6 +269,7 @@ class MediaProcessor(Service):
 
 ## Architecture
 
+### Single Server Mode
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  jb-serve (Go)                                          │
@@ -298,6 +299,85 @@ class MediaProcessor(Service):
 │  └── run() — auto-detects transport from service class │
 └─────────────────────────────────────────────────────────┘
 ```
+
+### Broker Mode (Distributed)
+```
+                         Clients
+                            │
+                            ▼
+                ┌───────────────────────┐
+                │  jb-serve broker      │
+                │  :9800                │
+                │  - aggregates tools   │
+                │  - routes requests    │
+                └───────────┬───────────┘
+                            │
+         ┌──────────────────┼──────────────────┐
+         ▼                  ▼                  ▼
+  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+  │ gpu-server-1│    │ gpu-server-2│    │ cpu-server  │
+  │ :9801       │    │ :9801       │    │ :9801       │
+  │ - whisper   │    │ - z-image   │    │ - embed     │
+  │ - ocr       │    │ - flux      │    │ - calculator│
+  └─────────────┘    └─────────────┘    └─────────────┘
+```
+
+**Broker mode** allows distributing tools across multiple servers:
+- Single entry point for clients (the broker)
+- Child servers register and send heartbeats
+- Broker routes requests based on tool availability
+- Automatic failover when children become unhealthy
+
+---
+
+## Broker Mode
+
+### Starting a Broker
+```bash
+jb-serve broker --port 9800
+```
+
+The broker doesn't run tools itself — it only aggregates and routes.
+
+### Registering Children
+Child servers register with the broker on startup:
+```bash
+# On GPU server 1
+jb-serve serve --port 9801 \
+  --broker http://broker-host:9800 \
+  --self-url http://gpu1:9801 \
+  --name "gpu-server-1"
+
+# On GPU server 2  
+jb-serve serve --port 9801 \
+  --broker http://broker-host:9800 \
+  --self-url http://gpu2:9801 \
+  --name "gpu-server-2"
+```
+
+### Broker Endpoints
+```bash
+# List connected children
+curl http://broker:9800/v1/broker/children
+
+# Aggregated tool list (from all healthy children)
+curl http://broker:9800/v1/tools
+
+# Tool requests are proxied to appropriate child
+curl -X POST http://broker:9800/v1/tools/z-image-turbo/generate \
+  -d '{"prompt": "..."}'
+# → Routed to whichever child has z-image-turbo
+
+# Health includes child status
+curl http://broker:9800/health
+# {"status":"ok","mode":"broker","children_total":2,"children_healthy":2}
+```
+
+### Child Registration Protocol
+1. Child POSTs to `/v1/broker/register` with ID, URL, name, and tool list
+2. Broker returns heartbeat interval
+3. Child sends heartbeats to `/v1/broker/heartbeat` periodically
+4. If heartbeats stop, broker marks child unhealthy then removes it
 
 ---
 
@@ -616,8 +696,15 @@ curl -X POST http://192.168.0.107:9800/v1/tools/whisper/transcribe \
 - Python `FileStore` client in jb-service base class
 - CLI commands: `jb-serve files ls/import/info/rm`
 
+### Phase 5 🚧 — Broker Mode (In Progress)
+- **Broker server** aggregates tools from multiple children
+- **Child registration** with heartbeat
+- **Request proxying** to appropriate backend
+- File store proxy (TODO)
+
 ### Remaining Candidates
 - [ ] Convert jb-whisper to MessagePack (if needed)
 - [ ] CLI daemon mode (`jb-serve start` persists)
 - [ ] Auto-restart on health failure
 - [ ] Tool hot-reload without restart
+- [ ] Broker: shared/distributed file store

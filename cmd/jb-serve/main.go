@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/calobozan/jb-serve/internal/client"
 	"github.com/calobozan/jb-serve/internal/config"
 	"github.com/calobozan/jb-serve/internal/server"
 	"github.com/calobozan/jb-serve/internal/tools"
@@ -16,6 +17,10 @@ var (
 	cfg      *config.Config
 	manager  *tools.Manager
 	executor *tools.Executor
+
+	// Global flags
+	serverPort int
+	apiClient  *client.Client
 )
 
 var rootCmd = &cobra.Command{
@@ -25,32 +30,55 @@ var rootCmd = &cobra.Command{
 Each tool is a git repo with a jumpboot.yaml manifest describing its
 capabilities, dependencies, and RPC interface.
 
-Uses github.com/richinsley/jumpboot for Python environment management.`,
+Uses github.com/richinsley/jumpboot for Python environment management.
+
+Most commands communicate with a running jb-serve server (like ollama).
+Start the server with: jb-serve serve
+
+Commands that require the server: list, info, start, stop, call
+Commands that work standalone: install, serve`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		if cmd.Name() == "help" {
 			return nil
 		}
-		return initApp()
+		return initApp(cmd)
 	},
 }
 
-func initApp() error {
-	var err error
-	cfg, err = config.Load()
-	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
+func initApp(cmd *cobra.Command) error {
+	// Commands that need direct manager access (standalone)
+	standaloneCommands := map[string]bool{
+		"install": true,
+		"serve":   true,
 	}
 
-	if err := cfg.EnsureDirs(); err != nil {
-		return fmt.Errorf("failed to create directories: %w", err)
+	// For standalone commands, initialize manager directly
+	if standaloneCommands[cmd.Name()] {
+		var err error
+		cfg, err = config.Load()
+		if err != nil {
+			return fmt.Errorf("failed to load config: %w", err)
+		}
+
+		if err := cfg.EnsureDirs(); err != nil {
+			return fmt.Errorf("failed to create directories: %w", err)
+		}
+
+		manager = tools.NewManager(cfg)
+		if err := manager.LoadAll(); err != nil {
+			return fmt.Errorf("failed to load tools: %w", err)
+		}
+
+		executor = tools.NewExecutor(manager)
+		return nil
 	}
 
-	manager = tools.NewManager(cfg)
-	if err := manager.LoadAll(); err != nil {
-		return fmt.Errorf("failed to load tools: %w", err)
+	// For all other commands, use HTTP client
+	apiClient = client.NewFromPort(serverPort)
+	if err := apiClient.Ping(); err != nil {
+		return fmt.Errorf("cannot connect to jb-serve on port %d: %w\n\nIs the server running? Start it with: jb-serve serve", serverPort, err)
 	}
 
-	executor = tools.NewExecutor(manager)
 	return nil
 }
 
@@ -62,6 +90,9 @@ func main() {
 }
 
 func init() {
+	// Global port flag
+	rootCmd.PersistentFlags().IntVarP(&serverPort, "port", "p", 9800, "Server port to connect to")
+
 	rootCmd.AddCommand(installCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(infoCmd)
@@ -72,7 +103,7 @@ func init() {
 	rootCmd.AddCommand(serveCmd)
 }
 
-// install
+// install - standalone, doesn't need server
 var installCmd = &cobra.Command{
 	Use:   "install <git-url-or-path>",
 	Short: "Install a tool from git or local path",
@@ -83,29 +114,32 @@ var installCmd = &cobra.Command{
 	},
 }
 
-// list
+// list - uses HTTP client
 var listJSON bool
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List installed tools",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		toolList := manager.List()
+		tools, err := apiClient.List()
+		if err != nil {
+			return err
+		}
 
 		if listJSON {
-			data, _ := json.MarshalIndent(toolList, "", "  ")
+			data, _ := json.MarshalIndent(tools, "", "  ")
 			fmt.Println(string(data))
 			return nil
 		}
 
-		if len(toolList) == 0 {
+		if len(tools) == 0 {
 			fmt.Println("No tools installed.")
 			return nil
 		}
 
 		fmt.Printf("%-20s %-10s %-12s %s\n", "NAME", "VERSION", "MODE", "STATUS")
-		for _, t := range toolList {
+		for _, t := range tools {
 			fmt.Printf("%-20s %-10s %-12s %s\n",
-				t.Name, t.Manifest.Version, t.Manifest.Runtime.Mode, t.Status)
+				t.Name, t.Version, t.Mode, t.Status)
 		}
 		return nil
 	},
@@ -115,13 +149,13 @@ func init() {
 	listCmd.Flags().BoolVar(&listJSON, "json", false, "Output as JSON")
 }
 
-// info
+// info - uses HTTP client
 var infoCmd = &cobra.Command{
 	Use:   "info <tool-name>",
 	Short: "Show tool details",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		info, err := manager.Info(args[0])
+		info, err := apiClient.Info(args[0])
 		if err != nil {
 			return err
 		}
@@ -139,16 +173,18 @@ var infoCmd = &cobra.Command{
 			}
 		}
 
-		fmt.Println("\nMethods:")
-		for name, method := range info.Methods {
-			fmt.Printf("  %s: %s\n", name, method.Description)
+		if names := info.MethodNames(); len(names) > 0 {
+			fmt.Println("\nMethods:")
+			for _, name := range names {
+				fmt.Printf("  - %s\n", name)
+			}
 		}
 
 		return nil
 	},
 }
 
-// schema
+// schema - uses HTTP client (gets info then extracts schema)
 var schemaCmd = &cobra.Command{
 	Use:   "schema <tool-name>[.method]",
 	Short: "Show RPC schema",
@@ -157,20 +193,26 @@ var schemaCmd = &cobra.Command{
 		parts := strings.SplitN(args[0], ".", 2)
 		toolName := parts[0]
 
-		tool, ok := manager.Get(toolName)
+		info, err := apiClient.Info(toolName)
+		if err != nil {
+			return err
+		}
+
+		// Methods from /v1/tools/{name} is a map[string]interface{}
+		methods, ok := info.Methods.(map[string]interface{})
 		if !ok {
-			return fmt.Errorf("tool not found: %s", toolName)
+			return fmt.Errorf("could not parse methods schema")
 		}
 
 		var data interface{}
 		if len(parts) == 2 {
-			method, ok := tool.Manifest.RPC.Methods[parts[1]]
+			method, ok := methods[parts[1]]
 			if !ok {
 				return fmt.Errorf("method not found: %s", parts[1])
 			}
 			data = method
 		} else {
-			data = tool.Manifest.RPC.Methods
+			data = methods
 		}
 
 		out, _ := json.MarshalIndent(data, "", "  ")
@@ -179,7 +221,7 @@ var schemaCmd = &cobra.Command{
 	},
 }
 
-// call
+// call - uses HTTP client
 var callJSON string
 var callCmd = &cobra.Command{
 	Use:   "call <tool.method> [key=value ...]",
@@ -192,7 +234,7 @@ Parameters can be passed as key=value pairs:
 Or as JSON with --json:
   jb-serve call calculator.add --json '{"a": 2, "b": 3}'
 
-Values are automatically converted based on the method's schema.`,
+Requires the jb-serve server to be running.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		parts := strings.SplitN(args[0], ".", 2)
@@ -202,16 +244,6 @@ Values are automatically converted based on the method's schema.`,
 
 		toolName := parts[0]
 		methodName := parts[1]
-
-		tool, ok := manager.Get(toolName)
-		if !ok {
-			return fmt.Errorf("tool not found: %s", toolName)
-		}
-
-		method, ok := tool.Manifest.RPC.Methods[methodName]
-		if !ok {
-			return fmt.Errorf("method not found: %s", methodName)
-		}
 
 		// Parse parameters
 		params := make(map[string]interface{})
@@ -223,6 +255,8 @@ Values are automatically converted based on the method's schema.`,
 			}
 		} else {
 			// key=value pairs from remaining args
+			// Note: Without schema access, we treat everything as strings
+			// The server will handle type conversion based on method schema
 			for _, arg := range args[1:] {
 				kv := strings.SplitN(arg, "=", 2)
 				if len(kv) != 2 {
@@ -230,31 +264,21 @@ Values are automatically converted based on the method's schema.`,
 				}
 				key, val := kv[0], kv[1]
 
-				// Type conversion based on schema
-				expectedType := "string"
-				if method.Input != nil && method.Input.Properties != nil {
-					if prop, ok := method.Input.Properties[key]; ok && prop != nil {
-						expectedType = prop.Type
-					}
+				// Try to parse as number or boolean
+				var parsed interface{} = val
+				var num float64
+				if _, err := fmt.Sscanf(val, "%f", &num); err == nil {
+					parsed = num
+				} else if val == "true" {
+					parsed = true
+				} else if val == "false" {
+					parsed = false
 				}
-
-				switch expectedType {
-				case "number", "integer":
-					var num float64
-					if _, err := fmt.Sscanf(val, "%f", &num); err == nil {
-						params[key] = num
-					} else {
-						params[key] = val
-					}
-				case "boolean":
-					params[key] = val == "true" || val == "1"
-				default:
-					params[key] = val
-				}
+				params[key] = parsed
 			}
 		}
 
-		result, err := executor.Call(toolName, methodName, params)
+		result, err := apiClient.Call(toolName, methodName, params)
 		if err != nil {
 			return err
 		}
@@ -269,27 +293,37 @@ func init() {
 	callCmd.Flags().StringVar(&callJSON, "json", "", "Parameters as JSON object")
 }
 
-// start
+// start - uses HTTP client
 var startCmd = &cobra.Command{
 	Use:   "start <tool-name>",
 	Short: "Start a persistent tool",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return executor.Start(args[0])
+		status, err := apiClient.Start(args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Started %s\n", status.Tool)
+		return nil
 	},
 }
 
-// stop
+// stop - uses HTTP client
 var stopCmd = &cobra.Command{
 	Use:   "stop <tool-name>",
 	Short: "Stop a persistent tool",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return executor.Stop(args[0])
+		status, err := apiClient.Stop(args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Stopped %s\n", status.Tool)
+		return nil
 	},
 }
 
-// serve
+// serve - standalone, starts the server
 var servePort int
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -301,5 +335,5 @@ var serveCmd = &cobra.Command{
 }
 
 func init() {
-	serveCmd.Flags().IntVarP(&servePort, "port", "p", 9800, "Port to listen on")
+	serveCmd.Flags().IntVar(&servePort, "port", 9800, "Port to listen on")
 }

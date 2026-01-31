@@ -36,6 +36,7 @@ type Executor struct {
 	queues        map[string]*jumpboot.QueueProcess       // MessagePack transport
 	healthCancels map[string]context.CancelFunc
 	mu            sync.RWMutex
+	serverPort    int // Port the server is listening on (for JB_SERVE_URL)
 }
 
 // NewExecutor creates a new executor
@@ -45,6 +46,19 @@ func NewExecutor(manager *Manager) *Executor {
 		repls:         make(map[string]*jumpboot.REPLPythonProcess),
 		queues:        make(map[string]*jumpboot.QueueProcess),
 		healthCancels: make(map[string]context.CancelFunc),
+		serverPort:    9800, // default
+	}
+}
+
+// SetServerPort sets the port for JB_SERVE_URL env var
+func (e *Executor) SetServerPort(port int) {
+	e.serverPort = port
+}
+
+// getEnv returns environment variables to pass to Python processes
+func (e *Executor) getEnv() map[string]string {
+	return map[string]string{
+		"JB_SERVE_URL": fmt.Sprintf("http://localhost:%d", e.serverPort),
 	}
 }
 
@@ -88,7 +102,7 @@ func (e *Executor) callOneshot(tool *Tool, methodName string, params map[string]
 	entrypoint := filepath.Join(tool.Path, tool.Manifest.Runtime.Entrypoint)
 
 	// Create REPL process - no module needed, we run main.py directly
-	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, nil, nil)
+	repl, err := tool.Env.NewREPLPythonProcess(nil, e.getEnv(), nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create REPL: %w", err)
 	}
@@ -134,7 +148,7 @@ func (e *Executor) callOneshotMsgpack(tool *Tool, methodName string, params map[
 	}
 
 	// Create queue process
-	queue, err := tool.Env.NewQueueProcess(program, nil, nil, nil)
+	queue, err := tool.Env.NewQueueProcess(program, nil, e.getEnv(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create queue process: %w", err)
 	}
@@ -315,7 +329,7 @@ func (e *Executor) Start(toolName string) error {
 
 // startRepl starts a tool with REPL transport
 func (e *Executor) startRepl(tool *Tool) error {
-	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, nil, nil)
+	repl, err := tool.Env.NewREPLPythonProcess(nil, e.getEnv(), nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create REPL: %w", err)
 	}
@@ -361,7 +375,7 @@ func (e *Executor) startMsgpack(tool *Tool) error {
 	}
 
 	// Create queue process
-	queue, err := tool.Env.NewQueueProcess(program, nil, nil, nil)
+	queue, err := tool.Env.NewQueueProcess(program, nil, e.getEnv(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to create queue process: %w", err)
 	}
@@ -609,7 +623,7 @@ func (e *Executor) GetSchema(toolName string) (map[string]interface{}, error) {
 		return nil, err
 	}
 
-	repl, err := tool.Env.NewREPLPythonProcess(nil, nil, nil, nil)
+	repl, err := tool.Env.NewREPLPythonProcess(nil, e.getEnv(), nil, nil)
 	if err != nil {
 		return nil, err
 	}

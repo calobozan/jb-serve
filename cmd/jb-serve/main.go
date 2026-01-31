@@ -47,6 +47,11 @@ Commands that work standalone: install, serve`,
 }
 
 func initApp(cmd *cobra.Command) error {
+	// Broker is fully standalone - doesn't need config or manager
+	if cmd.Name() == "broker" {
+		return nil
+	}
+
 	// Commands that need direct manager access (standalone)
 	standaloneCommands := map[string]bool{
 		"install": true,

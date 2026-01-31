@@ -84,6 +84,10 @@ func (s *Server) setupRoutes() {
 
 // ListenAndServe starts the server
 func (s *Server) ListenAndServe(port int) error {
+	// Tell executor what port we're on so Python tools can connect back
+	if s.executor != nil {
+		s.executor.SetServerPort(port)
+	}
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("jb-serve API listening on %s", addr)
 	return http.ListenAndServe(addr, s.authMiddleware(s.mux))

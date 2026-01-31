@@ -129,28 +129,45 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type toolSummary struct {
+	type serviceSummary struct {
 		Name         string   `json:"name"`
+		Type         string   `json:"type"`                    // "tool" or "builtin"
 		Version      string   `json:"version"`
 		Description  string   `json:"description"`
-		Capabilities []string `json:"capabilities"`
-		Mode         string   `json:"mode"`
+		Capabilities []string `json:"capabilities,omitempty"`
+		Mode         string   `json:"mode,omitempty"`
 		Status       string   `json:"status"`
 		HealthStatus string   `json:"health_status,omitempty"`
-		Methods      []string `json:"methods"`
+		Methods      []string `json:"methods,omitempty"`
 	}
 
-	toolList := s.manager.List()
-	summaries := make([]toolSummary, len(toolList))
+	var summaries []serviceSummary
 
-	for i, t := range toolList {
+	// Add built-in services first
+	fileStoreStatus := "disabled"
+	if s.filestore != nil {
+		fileStoreStatus = "enabled"
+	}
+	summaries = append(summaries, serviceSummary{
+		Name:        "filestore",
+		Type:        "builtin",
+		Version:     "1.0.0",
+		Description: "Persistent file storage with TTL and garbage collection",
+		Status:      fileStoreStatus,
+		Methods:     []string{"import", "get", "list", "rename", "delete"},
+	})
+
+	// Add user-installed tools
+	toolList := s.manager.List()
+	for _, t := range toolList {
 		methods := make([]string, 0, len(t.Manifest.RPC.Methods))
 		for name := range t.Manifest.RPC.Methods {
 			methods = append(methods, name)
 		}
 
-		summaries[i] = toolSummary{
+		summaries = append(summaries, serviceSummary{
 			Name:         t.Name,
+			Type:         "tool",
 			Version:      t.Manifest.Version,
 			Description:  t.Manifest.Description,
 			Capabilities: t.Manifest.Capabilities,
@@ -158,7 +175,7 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 			Status:       t.Status,
 			HealthStatus: t.HealthStatus,
 			Methods:      methods,
-		}
+		})
 	}
 
 	s.json(w, summaries)

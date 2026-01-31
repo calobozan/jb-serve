@@ -31,10 +31,11 @@ func NewFromPort(port int) *Client {
 	return New(fmt.Sprintf("http://localhost:%d", port))
 }
 
-// ToolInfo represents tool information from the API.
+// ToolInfo represents tool/service information from the API.
 // Note: Methods field differs between list ([]string) and info (map) endpoints.
 type ToolInfo struct {
 	Name         string      `json:"name"`
+	Type         string      `json:"type"` // "tool" or "builtin"
 	Version      string      `json:"version"`
 	Description  string      `json:"description"`
 	Capabilities []string    `json:"capabilities"`

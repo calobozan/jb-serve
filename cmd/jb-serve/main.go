@@ -132,14 +132,18 @@ var listCmd = &cobra.Command{
 		}
 
 		if len(tools) == 0 {
-			fmt.Println("No tools installed.")
+			fmt.Println("No services registered.")
 			return nil
 		}
 
-		fmt.Printf("%-20s %-10s %-12s %s\n", "NAME", "VERSION", "MODE", "STATUS")
+		fmt.Printf("%-20s %-8s %-10s %-12s %s\n", "NAME", "TYPE", "VERSION", "MODE", "STATUS")
 		for _, t := range tools {
-			fmt.Printf("%-20s %-10s %-12s %s\n",
-				t.Name, t.Version, t.Mode, t.Status)
+			mode := t.Mode
+			if mode == "" {
+				mode = "-"
+			}
+			fmt.Printf("%-20s %-8s %-10s %-12s %s\n",
+				t.Name, t.Type, t.Version, mode, t.Status)
 		}
 		return nil
 	},
